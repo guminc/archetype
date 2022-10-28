@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-// Factory v0.3.1
+// Factory v0.3.2
 //
 // 8888888888                888
 // 888                       888
