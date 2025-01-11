@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Archetype v0.7.0
+// Archetype v0.8.0
 //
 //        d8888                 888               888
 //       d88888                 888               888
@@ -13,9 +13,9 @@
 //                                                       Y8b d88P 888
 //                                                        "Y88P"  888
 
-pragma solidity ^0.8.4;
+pragma solidity ^0.8.20;
 
-import "./ArchetypeLogic.sol";
+import "./ArchetypeLogicErc721a.sol";
 import "erc721a-upgradeable/contracts/ERC721AUpgradeable.sol";
 import "erc721a-upgradeable/contracts/ERC721A__Initializable.sol";
 import "erc721a-upgradeable/contracts/extensions/ERC721AQueryableUpgradeable.sol";
@@ -23,7 +23,7 @@ import "./ERC721A__OwnableUpgradeable.sol";
 import "solady/src/utils/LibString.sol";
 import "@openzeppelin/contracts-upgradeable/token/common/ERC2981Upgradeable.sol";
 
-contract Archetype is
+contract ArchetypeErc721a is
   ERC721A__Initializable,
   ERC721AUpgradeable,
   ERC721A__OwnableUpgradeable,
@@ -34,13 +34,16 @@ contract Archetype is
   // EVENTS
   //
   event Invited(bytes32 indexed key, bytes32 indexed cid);
+  event BurnInvited(bytes32 indexed key, bytes32 indexed cid);
   event Referral(address indexed affiliate, address token, uint128 wad, uint256 numMints);
   event Withdrawal(address indexed src, address token, uint128 wad);
 
   //
   // VARIABLES
   //
-  mapping(bytes32 => DutchInvite) public invites;
+  mapping(bytes32 => AdvancedInvite) public invites;
+  mapping(bytes32 => uint256) public packedBonusDiscounts;
+  mapping(bytes32 => BurnInvite) public burnInvites;
   mapping(address => mapping(bytes32 => uint256)) private _minted;
   mapping(bytes32 => uint256) private _listSupply;
   mapping(address => uint128) private _ownerBalance;
@@ -48,7 +51,6 @@ contract Archetype is
 
   Config public config;
   PayoutConfig public payoutConfig;
-  BurnConfig public burnConfig;
   Options public options;
 
   //
@@ -65,23 +67,11 @@ contract Archetype is
     // check max bps not reached and min platform fee.
     if (
       config_.affiliateFee > MAXBPS ||
-      config_.discounts.affiliateDiscount > MAXBPS ||
+      config_.affiliateDiscount > MAXBPS ||
       config_.affiliateSigner == address(0) ||
       config_.maxBatchSize == 0
     ) {
       revert InvalidConfig();
-    }
-    // ensure mint tiers are correctly ordered from highest to lowest.
-    for (uint256 i = 1; i < config_.discounts.mintTiers.length; ) {
-      if (
-        config_.discounts.mintTiers[i].mintDiscount > MAXBPS ||
-        config_.discounts.mintTiers[i].numMints > config_.discounts.mintTiers[i - 1].numMints
-      ) {
-        revert InvalidConfig();
-      }
-      unchecked {
-        ++i;
-      }
     }
     config = config_;
     __Ownable_init();
@@ -121,8 +111,12 @@ contract Archetype is
       revert InvalidConfig();
     }
 
-    DutchInvite storage invite = invites[auth.key];
-    uint256 quantity;
+    AdvancedInvite storage invite = invites[auth.key];
+    uint256 packedDiscount = packedBonusDiscounts[auth.key];
+    uint256 curSupply = _totalMinted();
+    
+    uint256 totalQuantity;
+    uint256 totalBonusMints;
 
     for (uint256 i; i < toList.length; ) {
       uint256 quantityToAdd;
@@ -131,58 +125,19 @@ contract Archetype is
       } else {
         quantityToAdd = quantityList[i];
       }
-      quantity += quantityToAdd;
 
-      _mint(toList[i], quantityToAdd);
+      uint256 numBonusMints = ArchetypeLogicErc721a.bonusMintsAwarded(quantityToAdd, packedDiscount);
+      _mint(toList[i], quantityToAdd + numBonusMints);
+
+      totalQuantity += quantityToAdd;
+      totalBonusMints += numBonusMints;
 
       unchecked {
         ++i;
       }
     }
 
-    ValidationArgs memory args;
-    {
-      args = ValidationArgs({
-        owner: owner(),
-        affiliate: affiliate,
-        quantity: quantity,
-        curSupply: _totalMinted(),
-        listSupply: _listSupply[auth.key]
-      });
-    }
-
-    uint128 cost = uint128(
-      ArchetypeLogic.computePrice(
-        invite,
-        config.discounts,
-        args.quantity,
-        args.listSupply,
-        args.affiliate != address(0)
-      )
-    );
-
-    ArchetypeLogic.validateMint(invite, config, auth, _minted, signature, args, cost);
-
-    if (invite.limit < invite.maxSupply) {
-      _minted[_msgSender()][auth.key] += quantity;
-    }
-    if (invite.maxSupply < UINT32_MAX) {
-      _listSupply[auth.key] += quantity;
-    }
-
-    ArchetypeLogic.updateBalances(
-      invite,
-      config,
-      _ownerBalance,
-      _affiliateBalance,
-      affiliate,
-      quantity,
-      cost
-    );
-
-    if (msg.value > cost) {
-      _refund(_msgSender(), msg.value - cost);
-    }
+    validateAndCreditMint(invite, auth, totalQuantity, totalBonusMints, curSupply, affiliate, signature);
   }
 
   function mintTo(
@@ -192,46 +147,63 @@ contract Archetype is
     address affiliate,
     bytes calldata signature
   ) public payable {
-    DutchInvite storage i = invites[auth.key];
+    AdvancedInvite storage invite = invites[auth.key];
+    uint256 packedDiscount = packedBonusDiscounts[auth.key];
 
-    if (i.unitSize > 1) {
-      quantity = quantity * i.unitSize;
+    if (invite.unitSize > 1) {
+      quantity = quantity * invite.unitSize;
     }
 
+    uint256 curSupply = _totalMinted();
+
+    uint256 numBonusMints = ArchetypeLogicErc721a.bonusMintsAwarded(quantity, packedDiscount);
+    _mint(to, quantity + numBonusMints);
+
+    validateAndCreditMint(invite, auth, quantity, numBonusMints, curSupply, affiliate, signature);
+  }
+
+  function validateAndCreditMint(
+    AdvancedInvite storage invite,
+    Auth calldata auth,
+    uint256 quantity,
+    uint256 numBonusMints,
+    uint256 curSupply,
+    address affiliate,
+    bytes calldata signature
+  ) internal {
+    uint256 totalQuantity = quantity + numBonusMints;
     ValidationArgs memory args;
     {
       args = ValidationArgs({
         owner: owner(),
         affiliate: affiliate,
-        quantity: quantity,
-        curSupply: _totalMinted(),
+        quantity: totalQuantity,
+        curSupply: curSupply,
         listSupply: _listSupply[auth.key]
       });
     }
 
     uint128 cost = uint128(
-      ArchetypeLogic.computePrice(
-        i,
-        config.discounts,
-        args.quantity,
+      ArchetypeLogicErc721a.computePrice(
+        invite,
+        config.affiliateDiscount,
+        quantity,
         args.listSupply,
         args.affiliate != address(0)
       )
     );
 
-    ArchetypeLogic.validateMint(i, config, auth, _minted, signature, args, cost);
+    ArchetypeLogicErc721a.validateMint(invite, config, auth, _minted, signature, args, cost);
 
-    _mint(to, quantity);
-
-    if (i.limit < i.maxSupply) {
-      _minted[_msgSender()][auth.key] += quantity;
+    if (invite.limit < invite.maxSupply) {
+      _minted[_msgSender()][auth.key] += totalQuantity;
     }
-    if (i.maxSupply < UINT32_MAX) {
-      _listSupply[auth.key] += quantity;
+    if (invite.maxSupply < UINT32_MAX) {
+      _listSupply[auth.key] += totalQuantity;
     }
 
-    ArchetypeLogic.updateBalances(
-      i,
+    ArchetypeLogicErc721a.updateBalances(
+      invite.tokenAddress,
       config,
       _ownerBalance,
       _affiliateBalance,
@@ -245,32 +217,49 @@ contract Archetype is
     }
   }
 
-  function burnToMint(uint256[] calldata tokenIds) external {
+  function burnToMint(Auth calldata auth, uint256[] calldata tokenIds) external payable {
+    BurnInvite storage burnInvite = burnInvites[auth.key];
+
     uint256 curSupply = _totalMinted();
-    ArchetypeLogic.validateBurnToMint(config, burnConfig, tokenIds, curSupply, _minted);
+    uint128 cost = burnInvite.price;
+    ArchetypeLogicErc721a.validateBurnToMint(burnInvite, config, auth, tokenIds, curSupply, _minted, cost);
 
     address msgSender = _msgSender();
     for (uint256 i; i < tokenIds.length; ) {
-      address burnAddress = burnConfig.burnAddress != address(0)
-        ? burnConfig.burnAddress
+      address burnAddress = burnInvite.burnAddress != address(0)
+        ? burnInvite.burnAddress
         : address(0x000000000000000000000000000000000000dEaD);
-      burnConfig.archetype.transferFrom(msgSender, burnAddress, tokenIds[i]);
+      burnInvite.burnErc721.transferFrom(msgSender, burnAddress, tokenIds[i]);
       unchecked {
         ++i;
       }
     }
 
-    uint256 quantity = burnConfig.reversed
-      ? tokenIds.length * burnConfig.ratio
-      : tokenIds.length / burnConfig.ratio;
+    uint256 quantity = burnInvite.reversed
+      ? tokenIds.length * burnInvite.ratio
+      : tokenIds.length / burnInvite.ratio;
     _mint(msgSender, quantity);
 
-    if (burnConfig.limit < config.maxSupply) {
-      _minted[msgSender][bytes32("burn")] += quantity;
+    if (burnInvite.limit < config.maxSupply) {
+      _minted[msgSender][keccak256(abi.encodePacked("burn", auth.key))] += quantity;
+    }
+
+    ArchetypeLogicErc721a.updateBalances(
+      burnInvite.tokenAddress,
+      config,
+      _ownerBalance,
+      _affiliateBalance,
+      address(0), // burn to mint does not support affiliates
+      quantity,
+      cost
+    );
+
+    if (msg.value > cost) {
+      _refund(_msgSender(), msg.value - cost);
     }
   }
 
-  function tokenURI(uint256 tokenId) public view virtual override returns (string memory) {
+  function tokenURI(uint256 tokenId) public view virtual override(ERC721AUpgradeable, IERC721AUpgradeable) returns (string memory) {
     if (!_exists(tokenId)) revert URIQueryForNonexistentToken();
 
     return
@@ -286,7 +275,7 @@ contract Archetype is
   }
 
   function withdrawTokens(address[] memory tokens) public {
-    ArchetypeLogic.withdrawTokens(payoutConfig, _ownerBalance, owner(), tokens);
+    ArchetypeLogicErc721a.withdrawTokens(payoutConfig, _ownerBalance, owner(), tokens);
   }
 
   function withdrawAffiliate() external {
@@ -296,7 +285,7 @@ contract Archetype is
   }
 
   function withdrawTokensAffiliate(address[] memory tokens) public {
-    ArchetypeLogic.withdrawTokensAffiliate(_affiliateBalance, tokens);
+    ArchetypeLogicErc721a.withdrawTokensAffiliate(_affiliateBalance, tokens);
   }
 
   function ownerBalance() external view returns (uint128) {
@@ -332,9 +321,9 @@ contract Archetype is
     uint256 quantity,
     bool affiliateUsed
   ) external view returns (uint256) {
-    DutchInvite storage i = invites[key];
+    AdvancedInvite storage i = invites[key];
     uint256 listSupply_ = _listSupply[key];
-    return ArchetypeLogic.computePrice(i, config.discounts, quantity, listSupply_, affiliateUsed);
+    return ArchetypeLogicErc721a.computePrice(i, config.affiliateDiscount, quantity, listSupply_, affiliateUsed);
   }
 
   //
@@ -396,6 +385,17 @@ contract Archetype is
     config.affiliateFee = affiliateFee;
   }
 
+  function setAffiliateDiscount(uint16 affiliateDiscount) external _onlyOwner {
+    if (options.affiliateFeeLocked) {
+      revert LockedForever();
+    }
+    if (affiliateDiscount > MAXBPS) {
+      revert InvalidConfig();
+    }
+
+    config.affiliateDiscount = affiliateDiscount;
+  }
+
   /// @notice the password is "forever"
   function lockAffiliateFee(string memory password) external _onlyOwner {
     if (keccak256(abi.encodePacked(password)) != keccak256(abi.encodePacked("forever"))) {
@@ -405,42 +405,46 @@ contract Archetype is
     options.affiliateFeeLocked = true;
   }
 
-  function setDiscounts(Discount calldata discounts) external _onlyOwner {
-    if (options.discountsLocked) {
+  function setOwnerAltPayout(address ownerAltPayout) external _onlyOwner {
+    if (options.ownerAltPayoutLocked) {
       revert LockedForever();
     }
 
-    if (discounts.affiliateDiscount > MAXBPS) {
-      revert InvalidConfig();
-    }
-
-    // ensure mint tiers are correctly ordered from highest to lowest.
-    for (uint256 i = 1; i < discounts.mintTiers.length; ) {
-      if (
-        discounts.mintTiers[i].mintDiscount > MAXBPS ||
-        discounts.mintTiers[i].numMints > discounts.mintTiers[i - 1].numMints
-      ) {
-        revert InvalidConfig();
-      }
-      unchecked {
-        ++i;
-      }
-    }
-
-    config.discounts = discounts;
+    payoutConfig.ownerAltPayout = ownerAltPayout;
   }
 
-  /// @notice the password is "forever"
-  function lockDiscounts(string memory password) external _onlyOwner {
-    if (keccak256(abi.encodePacked(password)) != keccak256(abi.encodePacked("forever"))) {
-      revert WrongPassword();
-    }
-
-    options.discountsLocked = true;
+  function lockOwnerAltPayout() external _onlyOwner {
+    options.ownerAltPayoutLocked = true;
   }
 
   function setMaxBatchSize(uint32 maxBatchSize) external _onlyOwner {
     config.maxBatchSize = maxBatchSize;
+  }
+
+  function setBonusDiscounts(bytes32 _key, BonusDiscount[] calldata _bonusDiscounts) public onlyOwner {
+    if(_bonusDiscounts.length > 8) {
+      revert InvalidConfig();
+    }
+
+    uint256 packed;
+    for (uint8 i = 0; i < _bonusDiscounts.length; i++) {
+        if (i > 0 && _bonusDiscounts[i].numMints >= _bonusDiscounts[i - 1].numMints) {
+            revert InvalidConfig();
+        }
+        uint32 discount = (uint32(_bonusDiscounts[i].numMints) << 16) | uint32(_bonusDiscounts[i].numBonusMints);
+        packed |= uint256(discount) << (32 * i);
+    }
+    packedBonusDiscounts[_key] = packed;
+  }
+
+  function setBonusInvite(
+    bytes32 _key,
+    bytes32 _cid,
+    AdvancedInvite calldata _advancedInvite,
+    BonusDiscount[] calldata _bonusDiscount
+  ) external _onlyOwner {
+    setBonusDiscounts(_key, _bonusDiscount);
+    setAdvancedInvite(_key, _cid, _advancedInvite);
   }
 
   function setInvite(
@@ -448,14 +452,7 @@ contract Archetype is
     bytes32 _cid,
     Invite calldata _invite
   ) external _onlyOwner {
-    // approve token for withdrawals if erc20 list
-    if (_invite.tokenAddress != address(0)) {
-      bool success = IERC20(_invite.tokenAddress).approve(PAYOUTS, 2**256 - 1);
-      if (!success) {
-        revert NotApprovedToTransfer();
-      }
-    }
-    invites[_key] = DutchInvite({
+    setAdvancedInvite(_key, _cid, AdvancedInvite({
       price: _invite.price,
       reservePrice: _invite.price,
       delta: 0,
@@ -467,58 +464,38 @@ contract Archetype is
       unitSize: _invite.unitSize,
       tokenAddress: _invite.tokenAddress,
       isBlacklist: _invite.isBlacklist
-    });
-    emit Invited(_key, _cid);
+    }));
   }
 
-  function setDutchInvite(
+  function setAdvancedInvite(
     bytes32 _key,
     bytes32 _cid,
-    DutchInvite memory _dutchInvite
-  ) external _onlyOwner {
+    AdvancedInvite memory _AdvancedInvite
+  ) public _onlyOwner {
     // approve token for withdrawals if erc20 list
-    if (_dutchInvite.tokenAddress != address(0)) {
-      bool success = IERC20(_dutchInvite.tokenAddress).approve(PAYOUTS, 2**256 - 1);
+    if (_AdvancedInvite.tokenAddress != address(0)) {
+      bool success = IERC20(_AdvancedInvite.tokenAddress).approve(PAYOUTS, 2**256 - 1);
       if (!success) {
         revert NotApprovedToTransfer();
       }
     }
-    if (_dutchInvite.start < block.timestamp) {
-      _dutchInvite.start = uint32(block.timestamp);
+    if (_AdvancedInvite.start < block.timestamp) {
+      _AdvancedInvite.start = uint32(block.timestamp);
     }
-    invites[_key] = _dutchInvite;
+    invites[_key] = _AdvancedInvite;
     emit Invited(_key, _cid);
   }
 
-  function enableBurnToMint(
-    address archetype,
-    address burnAddress,
-    bool reversed,
-    uint16 ratio,
-    uint64 start,
-    uint64 limit
+  function setBurnInvite(
+    bytes32 _key,
+    bytes32 _cid,
+    BurnInvite memory _burnInvite
   ) external _onlyOwner {
-    burnConfig = BurnConfig({
-      archetype: IERC721(archetype),
-      burnAddress: burnAddress,
-      enabled: true,
-      reversed: reversed,
-      ratio: ratio,
-      start: start,
-      limit: limit
-    });
-  }
-
-  function disableBurnToMint() external _onlyOwner {
-    burnConfig = BurnConfig({
-      archetype: IERC721(address(0)),
-      burnAddress: address(0),
-      enabled: false,
-      reversed: false,
-      ratio: 0,
-      start: 0,
-      limit: 0
-    });
+    if (_burnInvite.start < block.timestamp) {
+      _burnInvite.start = uint32(block.timestamp);
+    }
+    burnInvites[_key] = _burnInvite;
+    emit BurnInvited(_key, _cid);
   }
 
   //
@@ -558,7 +535,7 @@ contract Archetype is
     public
     view
     virtual
-    override(ERC721AUpgradeable, ERC2981Upgradeable)
+    override(IERC721AUpgradeable, ERC721AUpgradeable, ERC2981Upgradeable)
     returns (bool)
   {
     // Supports the following `interfaceId`s:

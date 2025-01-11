@@ -13,6 +13,8 @@
 //                                                       Y8b d88P 888
 //    
 
+pragma solidity ^0.8.4;
+
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
