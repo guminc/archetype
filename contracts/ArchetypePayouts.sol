@@ -15,7 +15,9 @@
 
 pragma solidity ^0.8.4;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+using SafeERC20 for IERC20;
 
 error InvalidLength();
 error InvalidSplitShares();
@@ -61,10 +63,7 @@ contract ArchetypePayouts {
     } else {
       // ERC20 payments
       IERC20 paymentToken = IERC20(token);
-      bool success = paymentToken.transferFrom(msg.sender, address(this), totalAmount);
-      if (!success) {
-        revert TransferFailed();
-      }
+      paymentToken.safeTransferFrom(msg.sender, address(this), totalAmount);
 
       for (uint256 i = 0; i < recipients.length; i++) {
         if (splits[i] > 0) {
@@ -131,10 +130,7 @@ contract ArchetypePayouts {
       }
     } else {
       IERC20 erc20Token = IERC20(token);
-      bool success = erc20Token.transfer(to, wad);
-      if (!success) {
-        revert TransferFailed();
-      }
+      erc20Token.safeTransfer(to, wad);
     }
     emit Withdrawal(from, token, wad);
   }

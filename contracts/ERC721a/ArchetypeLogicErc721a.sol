@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// ArchetypeLogic v0.8.0
+// ArchetypeLogic v0.8.1
 //
 //        d8888                 888               888
 //       d88888                 888               888
@@ -17,9 +17,11 @@ pragma solidity ^0.8.20;
 
 import "../ArchetypePayouts.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "solady/src/utils/MerkleProofLib.sol";
 import "solady/src/utils/ECDSA.sol";
+
+using SafeERC20 for IERC20;
 
 error InvalidConfig();
 error MintNotYetStarted();
@@ -400,10 +402,7 @@ library ArchetypeLogicErc721a {
 
     if (tokenAddress != address(0)) {
       IERC20 erc20Token = IERC20(tokenAddress);
-      bool success = erc20Token.transferFrom(_msgSender(), address(this), value);
-      if (!success) {
-        revert TransferFailed();
-      }
+      erc20Token.safeTransferFrom(_msgSender(), address(this), value);
     }
   }
 
@@ -430,10 +429,7 @@ library ArchetypeLogicErc721a {
         }
       } else {
         IERC20 erc20Token = IERC20(tokenAddress);
-        bool success = erc20Token.transfer(msgSender, wad);
-        if (!success) {
-          revert TransferFailed();
-        }
+        erc20Token.safeTransfer(msgSender, wad);
       }
 
       emit Withdrawal(msgSender, tokenAddress, wad);
@@ -468,66 +464,45 @@ library ArchetypeLogicErc721a {
         revert BalanceEmpty();
       }
 
-      if (payoutConfig.ownerAltPayout == address(0)) {
-        address[] memory recipients = new address[](4);
-        recipients[0] = owner;
-        recipients[1] = PLATFORM;
-        recipients[2] = payoutConfig.partner;
-        recipients[3] = payoutConfig.superAffiliate;
+      address ownerPayout = owner;
+      if (payoutConfig.ownerAltPayout != address(0)) {
+        ownerPayout = payoutConfig.ownerAltPayout;
+      }
+      uint256 ownerShare = (uint256(wad) * payoutConfig.ownerBps) / 10000;
+      uint256 remainingShare = wad - ownerShare;
 
-        uint16[] memory splits = new uint16[](4);
-        splits[0] = payoutConfig.ownerBps;
-        splits[1] = payoutConfig.platformBps;
-        splits[2] = payoutConfig.partnerBps;
-        splits[3] = payoutConfig.superAffiliateBps;
-
-        if (tokenAddress == address(0)) {
-          ArchetypePayouts(PAYOUTS).updateBalances{ value: wad }(
-            wad,
-            tokenAddress,
-            recipients,
-            splits
-          );
-        } else {
-          ArchetypePayouts(PAYOUTS).updateBalances(wad, tokenAddress, recipients, splits);
-        }
+      if (tokenAddress == address(0)) {
+        (bool success, ) = payable(ownerPayout).call{ value: ownerShare }("");
+        if (!success) revert TransferFailed();
       } else {
-        uint256 ownerShare = (uint256(wad) * payoutConfig.ownerBps) / 10000;
-        uint256 remainingShare = wad - ownerShare;
+        IERC20(tokenAddress).safeTransfer(ownerPayout, ownerShare);
+      }
 
-        if (tokenAddress == address(0)) {
-          (bool success, ) = payable(payoutConfig.ownerAltPayout).call{ value: ownerShare }("");
-          if (!success) revert TransferFailed();
-        } else {
-          IERC20(tokenAddress).transfer(payoutConfig.ownerAltPayout, ownerShare);
-        }
+      address[] memory recipients = new address[](3);
+      recipients[0] = PLATFORM;
+      recipients[1] = payoutConfig.partner;
+      recipients[2] = payoutConfig.superAffiliate;
 
-        address[] memory recipients = new address[](3);
-        recipients[0] = PLATFORM;
-        recipients[1] = payoutConfig.partner;
-        recipients[2] = payoutConfig.superAffiliate;
+      uint16[] memory splits = new uint16[](3);
+      uint16 remainingBps = 10000 - payoutConfig.ownerBps;
+      splits[1] = uint16((uint256(payoutConfig.partnerBps) * 10000) / remainingBps);
+      splits[2] = uint16((uint256(payoutConfig.superAffiliateBps) * 10000) / remainingBps);
+      splits[0] = 10000 - splits[1] - splits[2];
 
-        uint16[] memory splits = new uint16[](3);
-        uint16 remainingBps = 10000 - payoutConfig.ownerBps;
-        splits[1] = uint16((uint256(payoutConfig.partnerBps) * 10000) / remainingBps);
-        splits[2] = uint16((uint256(payoutConfig.superAffiliateBps) * 10000) / remainingBps);
-        splits[0] = 10000 - splits[1] - splits[2];
-
-        if (tokenAddress == address(0)) {
-          ArchetypePayouts(PAYOUTS).updateBalances{ value: remainingShare }(
-            remainingShare,
-            tokenAddress,
-            recipients,
-            splits
-          );
-        } else {
-          ArchetypePayouts(PAYOUTS).updateBalances(
-            remainingShare,
-            tokenAddress,
-            recipients,
-            splits
-          );
-        }
+      if (tokenAddress == address(0)) {
+        ArchetypePayouts(PAYOUTS).updateBalances{ value: remainingShare }(
+          remainingShare,
+          tokenAddress,
+          recipients,
+          splits
+        );
+      } else {
+        ArchetypePayouts(PAYOUTS).updateBalances(
+          remainingShare,
+          tokenAddress,
+          recipients,
+          splits
+        );
       }
       emit Withdrawal(msgSender, tokenAddress, wad);
     }
