@@ -19,8 +19,9 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 
-contract ArchetypeBatch is Ownable {
+contract ArchetypeBatch is Ownable, IERC1155Receiver {
 
     // Execute multiple calls in a single transaction
     // targets: The addresses of the contracts
@@ -72,5 +73,21 @@ contract ArchetypeBatch is Ownable {
         for (uint256 i = 0; i < ids.length; i++) {
             IERC1155(asset).safeTransferFrom(address(this), recipient, ids[i], amounts[i], "");
         }
+    }
+
+    // Required for receiving single ERC1155 tokens
+    function onERC1155Received(address operator, address from, uint256 id, uint256 value, bytes calldata data) external pure returns (bytes4) {
+        return IERC1155Receiver.onERC1155Received.selector;
+    }
+
+    // Required for receiving batch ERC1155 tokens
+    function onERC1155BatchReceived(address operator, address from, uint256[] calldata ids, uint256[] calldata values, bytes calldata data) external pure returns (bytes4) {
+        return IERC1155Receiver.onERC1155BatchReceived.selector;
+    }
+
+    // Required by IERC165 (which IERC1155Receiver inherits from)
+    function supportsInterface(bytes4 interfaceId) external pure override returns (bool) {
+        return interfaceId == type(IERC1155Receiver).interfaceId || 
+               interfaceId == type(IERC165).interfaceId;
     }
 }
