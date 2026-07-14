@@ -11,27 +11,24 @@
 // d88P     888 888     "Y8888P 888  888  "Y8888   "Y888  "Y88888 88888P"   "Y8888
 //                                                            888 888
 //                                                       Y8b d88P 888
-//    
+//
 
 pragma solidity ^0.8.4;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "openzeppelin-v4/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
-import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 
-contract ArchetypeBatch is Ownable, IERC1155Receiver {
-
+contract ArchetypeBatch is Ownable {
     // Execute multiple calls in a single transaction
     // targets: The addresses of the contracts
     // values: The value to send to the contracts
     // datas The data to send to the contracts
-    function executeBatch(
-        address[] calldata targets,
-        uint256[] calldata values,
-        bytes[] calldata datas
-    ) external payable {
+    function executeBatch(address[] calldata targets, uint256[] calldata values, bytes[] calldata datas)
+        external
+        payable
+    {
         require(
             targets.length == values.length && targets.length == datas.length,
             "ArchetypeBatch: The array lengths must be identical"
@@ -40,7 +37,7 @@ contract ArchetypeBatch is Ownable, IERC1155Receiver {
         for (uint256 i = 0; i < targets.length; ++i) {
             (bool success, bytes memory returnData) = targets[i].call{value: values[i]}(datas[i]);
 
-            if(!success) {
+            if (!success) {
                 // Decode the return data as a string and revert with it
                 revert(string(returnData));
             }
@@ -49,19 +46,19 @@ contract ArchetypeBatch is Ownable, IERC1155Receiver {
 
     // Emergency function: In case any ETH get stuck in the contract unintentionally
     // Only owner can retrieve the asset balance to a recipient address
-    function rescueETH(address recipient) onlyOwner external {
-        payable(recipient).call{ value: address(this).balance }("");
+    function rescueETH(address recipient) external onlyOwner {
+        payable(recipient).call{value: address(this).balance}("");
     }
 
     // Emergency function: In case any ERC20 tokens get stuck in the contract unintentionally
     // Only owner can retrieve the asset balance to a recipient address
-    function rescueERC20(address asset, address recipient) onlyOwner external { 
+    function rescueERC20(address asset, address recipient) external onlyOwner {
         asset.call(abi.encodeWithSelector(0xa9059cbb, recipient, IERC20(asset).balanceOf(address(this))));
     }
 
     // Emergency function: In case any ERC721 tokens get stuck in the contract unintentionally
     // Only owner can retrieve the asset balance to a recipient address
-    function rescueERC721(address asset, uint256[] calldata ids, address recipient) onlyOwner external {
+    function rescueERC721(address asset, uint256[] calldata ids, address recipient) external onlyOwner {
         for (uint256 i = 0; i < ids.length; i++) {
             IERC721(asset).transferFrom(address(this), recipient, ids[i]);
         }
@@ -69,25 +66,12 @@ contract ArchetypeBatch is Ownable, IERC1155Receiver {
 
     // Emergency function: In case any ERC1155 tokens get stuck in the contract unintentionally
     // Only owner can retrieve the asset balance to a recipient address
-    function rescueERC1155(address asset, uint256[] calldata ids, uint256[] calldata amounts, address recipient) onlyOwner external {
+    function rescueERC1155(address asset, uint256[] calldata ids, uint256[] calldata amounts, address recipient)
+        external
+        onlyOwner
+    {
         for (uint256 i = 0; i < ids.length; i++) {
             IERC1155(asset).safeTransferFrom(address(this), recipient, ids[i], amounts[i], "");
         }
-    }
-
-    // Required for receiving single ERC1155 tokens
-    function onERC1155Received(address operator, address from, uint256 id, uint256 value, bytes calldata data) external pure returns (bytes4) {
-        return IERC1155Receiver.onERC1155Received.selector;
-    }
-
-    // Required for receiving batch ERC1155 tokens
-    function onERC1155BatchReceived(address operator, address from, uint256[] calldata ids, uint256[] calldata values, bytes calldata data) external pure returns (bytes4) {
-        return IERC1155Receiver.onERC1155BatchReceived.selector;
-    }
-
-    // Required by IERC165 (which IERC1155Receiver inherits from)
-    function supportsInterface(bytes4 interfaceId) external pure override returns (bool) {
-        return interfaceId == type(IERC1155Receiver).interfaceId || 
-               interfaceId == type(IERC165).interfaceId;
     }
 }

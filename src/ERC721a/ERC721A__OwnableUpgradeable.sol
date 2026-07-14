@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // OpenZeppelin Contracts v4.4.1 (access/Ownable.sol)
 
-import 'erc721a-upgradeable/contracts/ERC721A__Initializable.sol';
-import 'erc721a-upgradeable/contracts/ERC721AUpgradeable.sol';
+import "erc721a-upgradeable/contracts/ERC721A__Initializable.sol";
+import "erc721a-upgradeable/contracts/ERC721AUpgradeable.sol";
 
 pragma solidity ^0.8.4;
 

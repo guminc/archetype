@@ -1,0 +1,19 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+ignored_warnings_from = ["lib"]
+
+remappings = [
+  "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-v4-contracts-upgradeable/contracts/",
+  "@openzeppelin/=lib/openzeppelin-contracts/",
+  "openzeppelin-v4/=lib/openzeppelin-v4-contracts/contracts/",
+  "openzeppelin-v4-upgradeable/=lib/openzeppelin-v4-contracts-upgradeable/contracts/",
+  "erc721a-upgradeable/=lib/ERC721A-Upgradeable/",
+  "solady/=lib/solady/",
+  "dn404/=lib/dn404/",
+  "forge-std/=lib/forge-std/src/",
+]
