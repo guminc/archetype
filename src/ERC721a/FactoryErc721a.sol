@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-// Factory v0.9.1
+// Factory v10.0
 //
 // 8888888888                888
 // 888                       888
@@ -19,9 +19,11 @@ import "./ArchetypeErc721a.sol";
 import "./ArchetypeLogicErc721a.sol";
 import "openzeppelin-v4/proxy/Clones.sol";
 import "openzeppelin-v4/access/Ownable.sol";
+import {RoyaltyPolicyRegistry} from "../RoyaltyPolicyRegistry.sol";
 
 error InsufficientDeployFee();
 error InvalidOwner();
+error InvalidRoyaltyPolicyRegistry();
 
 contract FactoryErc721a is Ownable {
     event CollectionAdded(address indexed sender, address indexed receiver, address collection);
@@ -29,10 +31,14 @@ contract FactoryErc721a is Ownable {
 
     address public archetype;
     uint256 public deployFee;
+    RoyaltyPolicyRegistry public immutable royaltyPolicyRegistry;
+    mapping(address => uint256) public senderSaltNonce;
 
-    constructor(address archetype_, address owner_) {
+    constructor(address archetype_, address owner_, RoyaltyPolicyRegistry royaltyPolicyRegistry_) {
         if (owner_ == address(0)) revert InvalidOwner();
+        if (address(royaltyPolicyRegistry_).code.length == 0) revert InvalidRoyaltyPolicyRegistry();
         archetype = archetype_;
+        royaltyPolicyRegistry = royaltyPolicyRegistry_;
         _transferOwnership(owner_);
     }
 
@@ -47,11 +53,12 @@ contract FactoryErc721a is Ownable {
             revert InsufficientDeployFee();
         }
 
-        bytes32 salt = keccak256(abi.encodePacked(block.timestamp, msg.sender, block.chainid));
+        bytes32 salt = keccak256(abi.encode(msg.sender, senderSaltNonce[msg.sender]++, block.chainid));
         address clone = Clones.cloneDeterministic(archetype, salt);
         ArchetypeErc721a token = ArchetypeErc721a(clone);
         token.initialize(name, symbol, config, payoutConfig, _receiver);
         token.transferOwnership(_receiver);
+        royaltyPolicyRegistry.registerScatterCollection(clone);
 
         if (deployFee > 0) {
             ArchetypeAddresses memory addrs = ArchetypeErc721a(archetype).archetypeAddresses();

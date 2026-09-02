@@ -5,7 +5,15 @@ libs = ["lib"]
 optimizer = true
 optimizer_runs = 200
 via_ir = true
+evm_version = "cancun"
 ignored_warnings_from = ["lib"]
+compilation_restrictions = [
+  { paths = "src/ArchetypeBatch.sol", version = "=0.8.36" },
+  { paths = "src/ArchetypeBatchV100.sol", version = "=0.8.36" },
+  { paths = "src/ArchetypePayouts.sol", version = "=0.8.36" },
+  { paths = "src/AffiliateSignerRegistry.sol", version = "=0.8.36" },
+  { paths = "src/MintFeeRegistry.sol", version = "=0.8.36" },
+]
 
 remappings = [
   "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-v4-contracts-upgradeable/contracts/",

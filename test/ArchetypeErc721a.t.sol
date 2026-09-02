@@ -3,22 +3,42 @@
 pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
-import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {IERC721} from "openzeppelin-v4/token/ERC721/IERC721.sol";
 import {IERC721AUpgradeable} from "erc721a-upgradeable/contracts/IERC721AUpgradeable.sol";
-import {ArchetypeBatch} from "../src/ArchetypeBatch.sol";
-import {ArchetypePayouts, BalanceEmpty as PayoutBalanceEmpty, NotApprovedToWithdraw} from "../src/ArchetypePayouts.sol";
+import {ArchetypeBatchV100} from "../src/ArchetypeBatchV100.sol";
+import "../src/AffiliateAuthorization.sol";
+import {
+    ArchetypePayouts,
+    BalanceEmpty as PayoutBalanceEmpty,
+    InvalidSplitShares,
+    NotApprovedToWithdraw,
+    UnexpectedTokenBalanceChange,
+    InvalidPayouts
+} from "../src/ArchetypePayouts.sol";
 import {TestErc20} from "../src/TestErc20.sol";
+import {RoyaltyPolicyRegistry} from "../src/RoyaltyPolicyRegistry.sol";
+import {NoReturnErc20} from "./mocks/NoReturnErc20.sol";
+import {FeeOnTransferErc20} from "./mocks/FeeOnTransferErc20.sol";
+import {ReentrantAffiliate} from "./mocks/ReentrantAffiliate.sol";
+import {MintFeeRegistry} from "../src/MintFeeRegistry.sol";
+import {AffiliateSignerRegistry} from "../src/AffiliateSignerRegistry.sol";
+import {
+    MintConstraints,
+    BurnConstraints,
+    UnexpectedMintCurrency,
+    InsufficientMintOutput,
+    ExcessiveNativeValue,
+    UnexpectedBurnCollection,
+    UnexpectedBurnRecipient
+} from "../src/MintConstraints.sol";
 import {ArchetypeErc721a, Config, PayoutConfig, Invite, Auth} from "../src/ERC721a/ArchetypeErc721a.sol";
 import {
-    AdvancedInvite,
+    InvalidConfig,
     BonusDiscount,
     BurnInvite,
     NotOwner,
     LockedForever,
-    InvalidSignature,
-    NotShareholder,
-    BalanceEmpty,
     Blacklisted,
     WalletUnauthorizedToMint,
     MintNotYetStarted,
@@ -32,6 +52,9 @@ import {
     NotApprovedToTransfer,
     InvalidAmountOfTokens,
     NotTokenOwner,
+    MintCostOverflow,
+    ExcessiveCurrencyCost,
+    Erc721BatchMint,
     ArchetypeAddresses
 } from "../src/ERC721a/ArchetypeLogicErc721a.sol";
 import {
@@ -54,6 +77,9 @@ contract ArchetypeErc721aTest is Test {
 
     ArchetypeErc721a internal archetypeImplementation;
     FactoryErc721a internal factory;
+    RoyaltyPolicyRegistry internal royaltyPolicyRegistry;
+    MintFeeRegistry internal mintFeeRegistry;
+    AffiliateSignerRegistry internal affiliateSignerRegistry;
 
     address internal owner;
     address internal buyer;
@@ -77,7 +103,6 @@ contract ArchetypeErc721aTest is Test {
 
         defaultConfig = Config({
             baseUri: "ipfs://bafkreieqcdphcfojcd2vslsxrhzrjqr6cxjlyuekpghzehfexi5c3w55eq",
-            affiliateSigner: affiliateSigner,
             maxSupply: 5000,
             maxBatchSize: 20,
             affiliateFee: 1500,
@@ -97,13 +122,18 @@ contract ArchetypeErc721aTest is Test {
         ArchetypePayouts payoutsImpl = new ArchetypePayouts();
         vm.etch(PAYOUTS, address(payoutsImpl).code);
 
-        ArchetypeBatch batchImpl = new ArchetypeBatch();
+        royaltyPolicyRegistry = new RoyaltyPolicyRegistry(owner);
+        ArchetypeBatchV100 batchImpl = new ArchetypeBatchV100(address(this), royaltyPolicyRegistry);
         vm.etch(BATCH, address(batchImpl).code);
 
-        archetypeImplementation = new ArchetypeErc721a(PLATFORM, PAYOUTS, BATCH);
+        mintFeeRegistry = new MintFeeRegistry(owner, other, 0, 1 ether, 0);
+        affiliateSignerRegistry = new AffiliateSignerRegistry(owner, affiliateSigner);
+        archetypeImplementation =
+            new ArchetypeErc721a(PLATFORM, PAYOUTS, BATCH, mintFeeRegistry, affiliateSignerRegistry);
 
         _prank(owner);
-        factory = new FactoryErc721a(address(archetypeImplementation), owner);
+        factory = new FactoryErc721a(address(archetypeImplementation), owner, royaltyPolicyRegistry);
+        royaltyPolicyRegistry.setApprovedFactory(address(factory), true);
 
         _prank(other);
     }
@@ -116,9 +146,36 @@ contract ArchetypeErc721aTest is Test {
         assertEq(addrs.batch, BATCH);
     }
 
+    function test_constructor_revertsWhenPayoutsIsZero() public {
+        vm.expectRevert(InvalidPayouts.selector);
+        new ArchetypeErc721a(PLATFORM, address(0), BATCH, mintFeeRegistry, affiliateSignerRegistry);
+    }
+
+    function test_constructor_revertsWhenPayoutsIsEoa() public {
+        vm.expectRevert(InvalidPayouts.selector);
+        new ArchetypeErc721a(PLATFORM, makeAddr("payoutsEoa"), BATCH, mintFeeRegistry, affiliateSignerRegistry);
+    }
+
+    function test_constructor_acceptsArchetypePayouts() public {
+        ArchetypePayouts payouts = new ArchetypePayouts();
+        ArchetypeErc721a implementation =
+            new ArchetypeErc721a(PLATFORM, address(payouts), BATCH, mintFeeRegistry, affiliateSignerRegistry);
+
+        assertEq(implementation.archetypeAddresses().payouts, address(payouts));
+    }
+
+    function test_constructor_rejectsZeroOrCodelessBatch() public {
+        vm.expectRevert(InvalidConfig.selector);
+        new ArchetypeErc721a(PLATFORM, PAYOUTS, address(0), mintFeeRegistry, affiliateSignerRegistry);
+
+        vm.expectRevert(InvalidConfig.selector);
+        new ArchetypeErc721a(PLATFORM, PAYOUTS, makeAddr("codeless batch"), mintFeeRegistry, affiliateSignerRegistry);
+    }
+
     function test_factoryConstructor_setsOwnerFromArgument() public {
         _prank(other);
-        FactoryErc721a factoryWithOwnerArg = new FactoryErc721a(address(archetypeImplementation), owner);
+        FactoryErc721a factoryWithOwnerArg =
+            new FactoryErc721a(address(archetypeImplementation), owner, royaltyPolicyRegistry);
 
         assertEq(factoryWithOwnerArg.owner(), owner);
         assertEq(factoryWithOwnerArg.archetype(), address(archetypeImplementation));
@@ -126,7 +183,7 @@ contract ArchetypeErc721aTest is Test {
 
     function test_factoryConstructor_failsWhenOwnerIsZero() public {
         vm.expectRevert(FactoryInvalidOwner.selector);
-        new FactoryErc721a(address(archetypeImplementation), address(0));
+        new FactoryErc721a(address(archetypeImplementation), address(0), royaltyPolicyRegistry);
     }
 
     function test_createCollection_initializesClone() public {
@@ -135,16 +192,47 @@ contract ArchetypeErc721aTest is Test {
 
         assertEq(collection.symbol(), "POOKIE");
         assertEq(collection.owner(), owner);
+        assertTrue(royaltyPolicyRegistry.scatterCollections(address(collection)));
     }
 
-    function test_initialize_failsWhenCalledTwice() public {
+    function test_createCollection_allowsTheSameSenderTwiceInOneBlock() public {
         _prank(other);
-        archetypeImplementation.initialize("Flookie", "POOKIE", defaultConfig, defaultPayoutConfig, owner);
+        address first = factory.createCollection(owner, "Pookie", "POOKIE", defaultConfig, defaultPayoutConfig);
+        address second = factory.createCollection(owner, "Snoozle", "SNOOZ", defaultConfig, defaultPayoutConfig);
 
-        assertEq(archetypeImplementation.name(), "Flookie");
+        assertFalse(first == second);
+        assertEq(factory.senderSaltNonce(other), 2);
+        assertEq(ArchetypeErc721a(first).name(), "Pookie");
+        assertEq(ArchetypeErc721a(second).name(), "Snoozle");
+    }
 
+    function test_setBonusDiscounts_failsWhenCallerIsNotOwner() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        BonusDiscount[] memory discounts = new BonusDiscount[](1);
+        discounts[0] = BonusDiscount({numMints: 2, numBonusMints: 1});
+
+        _prank(other);
+        vm.expectRevert(NotOwner.selector);
+        collection.setBonusDiscounts(PUBLIC_KEY, discounts);
+    }
+
+    function test_setBonusDiscounts_acceptsTheOwnerThroughItsConfiguredBatch() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        BonusDiscount[] memory discounts = new BonusDiscount[](1);
+        discounts[0] = BonusDiscount({numMints: 2, numBonusMints: 1});
+        CurrentCallerBatch batchCaller = new CurrentCallerBatch(owner);
+        vm.etch(BATCH, address(batchCaller).code);
+
+        _prank(BATCH);
+        collection.setBonusDiscounts(PUBLIC_KEY, discounts);
+
+        assertEq(collection.packedBonusDiscounts(PUBLIC_KEY), uint256(2) << 16 | 1);
+    }
+
+    function test_implementationCannotBeInitialized() public {
+        _prank(other);
         vm.expectRevert(bytes("ERC721A__Initializable: contract is already initialized"));
-        archetypeImplementation.initialize("Wookie", "POOKIE", defaultConfig, defaultPayoutConfig, owner);
+        archetypeImplementation.initialize("Flookie", "POOKIE", defaultConfig, defaultPayoutConfig, owner);
     }
 
     function test_createCollection_failsWhenDeployFeeNotPaid() public {
@@ -208,8 +296,642 @@ contract ArchetypeErc721aTest is Test {
         Auth memory auth = Auth({key: PUBLIC_KEY, proof: proof});
 
         _prank(buyer);
-        collection.mint{value: 0.1 ether}(auth, 1, address(0), "");
+        collection.mint{value: 0.1 ether}(auth, 1, address(0), "", _constraints());
 
+        assertEq(collection.ownerOf(1), buyer);
+        assertEq(collection.totalSupply(), 1);
+    }
+
+    function test_mint_publicMinimumChargesPaidQuantityAndExcludesBonuses() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        ArchetypePayouts payouts = ArchetypePayouts(PAYOUTS);
+        _setPublicInvite(collection, 0.1 ether, uint32(block.timestamp));
+
+        BonusDiscount[] memory discounts = new BonusDiscount[](1);
+        discounts[0] = BonusDiscount({numMints: 2, numBonusMints: 1});
+        _prank(owner);
+        collection.setBonusDiscounts(PUBLIC_KEY, discounts);
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(0.01 ether);
+
+        (uint256 currencyCost, uint256 nativeValue,,) = collection.computeMintPayment(PUBLIC_KEY, 2, false);
+        assertEq(currencyCost, 0.2 ether);
+        assertEq(nativeValue, 0.21 ether);
+
+        _prank(buyer);
+        collection.mint{value: nativeValue}(_publicAuth(), 2, address(0), "", _constraints());
+
+        assertEq(collection.balanceOf(buyer), 3);
+        assertEq(address(collection).balance, 0);
+        assertEq(payouts.balance(owner), 0.19 ether);
+        assertEq(payouts.balance(PLATFORM), 0.02 ether);
+
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(0.02 ether);
+        (, nativeValue,,) = collection.computeMintPayment(PUBLIC_KEY, 1, false);
+        assertEq(nativeValue, 0.115 ether);
+    }
+
+    function test_mint_publicMinimumIncludesUnitSize() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        Invite memory invite = Invite({
+            price: 0,
+            start: uint32(block.timestamp),
+            end: 0,
+            limit: 100,
+            maxSupply: 100,
+            unitSize: 3,
+            tokenAddress: address(0),
+            isBlacklist: false
+        });
+        _setInvite(collection, PUBLIC_KEY, invite);
+
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(0.01 ether);
+
+        (, uint256 nativeValue,,) = collection.computeMintPayment(PUBLIC_KEY, 2, false);
+        assertEq(nativeValue, 0.06 ether);
+
+        _prank(buyer);
+        collection.mint{value: nativeValue}(_publicAuth(), 2, address(0), "", _constraints());
+        assertEq(collection.balanceOf(buyer), 6);
+        assertEq(ArchetypePayouts(PAYOUTS).balance(PLATFORM), 0.06 ether);
+    }
+
+    function test_mint_feeIncreaseRequiresPaymentAtTheLiveFee() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        _setPublicInvite(collection, 0.1 ether, uint32(block.timestamp));
+
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(0.01 ether);
+        (, uint256 previousNativeValue,,) = collection.computeMintPayment(PUBLIC_KEY, 1, false);
+        assertEq(previousNativeValue, 0.105 ether);
+
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(0.02 ether);
+        (, uint256 currentNativeValue,,) = collection.computeMintPayment(PUBLIC_KEY, 1, false);
+        assertEq(currentNativeValue, 0.115 ether);
+
+        _prank(buyer);
+        vm.expectRevert(InsufficientEthSent.selector);
+        collection.mint{value: previousNativeValue}(_publicAuth(), 1, address(0), "", _constraints());
+
+        MintConstraints memory constraints = _constraints();
+        constraints.maxNativeValue = previousNativeValue + 0.001 ether;
+        _prank(buyer);
+        vm.expectRevert(ExcessiveNativeValue.selector);
+        collection.mint{value: currentNativeValue}(_publicAuth(), 1, address(0), "", constraints);
+
+        _prank(buyer);
+        constraints.maxNativeValue = currentNativeValue;
+        collection.mint{value: currentNativeValue}(_publicAuth(), 1, address(0), "", constraints);
+
+        assertEq(collection.ownerOf(1), buyer);
+        assertEq(ArchetypePayouts(PAYOUTS).balance(owner), 0.095 ether);
+        assertEq(ArchetypePayouts(PAYOUTS).balance(PLATFORM), 0.02 ether);
+    }
+
+    function test_mint_nativeValueConstraintRejectsAboveAndAllowsEqualOrBelowWithRefund() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        _setPublicInvite(collection, 0, uint32(block.timestamp));
+
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(0.01 ether);
+
+        MintConstraints memory constraints = _constraints();
+        constraints.maxNativeValue = 0.01 ether - 1;
+        _prank(buyer);
+        vm.expectRevert(ExcessiveNativeValue.selector);
+        collection.mint{value: 0.02 ether}(_publicAuth(), 1, address(0), "", constraints);
+
+        constraints.maxNativeValue = 0.01 ether;
+        collection.mint{value: 0.01 ether}(_publicAuth(), 1, address(0), "", constraints);
+
+        constraints.maxNativeValue = 0.02 ether;
+        vm.txGasPrice(0);
+        uint256 buyerBalanceBefore = buyer.balance;
+        collection.mint{value: 0.02 ether}(_publicAuth(), 1, address(0), "", constraints);
+
+        assertEq(collection.balanceOf(buyer), 2);
+        assertEq(buyerBalanceBefore - buyer.balance, 0.01 ether);
+        assertEq(address(collection).balance, 0);
+    }
+
+    function test_mint_percentageFeeAbovePublicMinimumAddsNoSurcharge() public {
+        PayoutConfig memory payout = defaultPayoutConfig;
+        payout.ownerBps = 8500;
+        payout.platformBps = 1500;
+        ArchetypeErc721a collection = _createCollectionWithPayout(owner, defaultConfig, payout);
+        _setPublicInvite(collection, 0.1 ether, uint32(block.timestamp));
+
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(0.01 ether);
+
+        (, uint256 nativeValue,,) = collection.computeMintPayment(PUBLIC_KEY, 1, false);
+        assertEq(nativeValue, 0.1 ether);
+
+        _prank(buyer);
+        collection.mint{value: nativeValue}(_publicAuth(), 1, address(0), "", _constraints());
+
+        ArchetypePayouts payouts = ArchetypePayouts(PAYOUTS);
+        assertEq(payouts.balance(owner), 0.085 ether);
+        assertEq(payouts.balance(PLATFORM), 0.015 ether);
+    }
+
+    function test_mint_publicMinimumWithAffiliateAccountsForEveryWei() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        ArchetypePayouts payouts = ArchetypePayouts(PAYOUTS);
+        address affiliate = makeAddr("minimum fee affiliate");
+        _setPublicInvite(collection, 101, uint32(block.timestamp));
+
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(7);
+
+        (uint256 currencyCost, uint256 nativeValue,,) = collection.computeMintPayment(PUBLIC_KEY, 1, true);
+        assertEq(currencyCost, 101);
+        assertEq(nativeValue, 104);
+
+        vm.recordLogs();
+        _prank(buyer);
+        collection.mint{value: nativeValue}(
+            _publicAuth(), 1, affiliate, _affiliateSignature(collection, affiliate), _constraints()
+        );
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(payouts.balance(affiliate), 15);
+        assertEq(payouts.balance(owner), 82);
+        assertEq(payouts.balance(PLATFORM), 7);
+        assertEq(address(collection).balance, 0);
+
+        _assertReferralLog(logs, affiliate, address(0), 15, 1, 104);
+    }
+
+    function test_mint_erc20ReferralEventCarriesThePulledCurrencyCost() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        TestErc20 erc20 = new TestErc20();
+        address affiliate = makeAddr("erc20 affiliate");
+        bytes32 key = keccak256(abi.encodePacked(address(erc20)));
+        _setInvite(collection, key, _erc20Invite(address(erc20), 1 ether));
+
+        _prank(buyer);
+        erc20.mint(2 ether);
+        erc20.approve(address(collection), 2 ether);
+
+        vm.recordLogs();
+        _prank(buyer);
+        collection.mint(
+            _auth(key),
+            2,
+            affiliate,
+            _affiliateSignature(collection, affiliate),
+            _constraints(address(erc20), type(uint128).max, 2)
+        );
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        _assertReferralLog(logs, affiliate, address(erc20), 0.3 ether, 2, 2 ether);
+    }
+
+    function test_mint_zeroPriceAffiliateEventCarriesZeroPaymentValue() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        address affiliate = makeAddr("free affiliate");
+        _setPublicInvite(collection, 0, uint32(block.timestamp));
+
+        vm.recordLogs();
+        _prank(buyer);
+        collection.mint(_publicAuth(), 1, affiliate, _affiliateSignature(collection, affiliate), _constraints());
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(collection.ownerOf(1), buyer);
+        _assertReferralLog(logs, affiliate, address(0), 0, 1, 0);
+    }
+
+    function _assertReferralLog(
+        Vm.Log[] memory logs,
+        address affiliate,
+        address token,
+        uint128 wad,
+        uint256 numMints,
+        uint256 paymentValue
+    ) internal pure {
+        bytes32 referralTopic = keccak256("Referral(address,address,uint128,uint256,uint256)");
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics[0] != referralTopic) continue;
+            assertEq(logs[i].topics.length, 2, "Referral must index only the affiliate");
+            assertEq(address(uint160(uint256(logs[i].topics[1]))), affiliate, "Referral affiliate");
+            (address loggedToken, uint128 loggedWad, uint256 loggedNumMints, uint256 loggedPaymentValue) =
+                abi.decode(logs[i].data, (address, uint128, uint256, uint256));
+            assertEq(loggedToken, token, "Referral token");
+            assertEq(loggedWad, wad, "Referral wad");
+            assertEq(loggedNumMints, numMints, "Referral numMints");
+            assertEq(loggedPaymentValue, paymentValue, "Referral paymentValue");
+            return;
+        }
+        revert("no Referral log recorded");
+    }
+
+    function test_mint_paidExclusiveInviteHasNoNativeMinimum() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        ArchetypePayouts payouts = ArchetypePayouts(PAYOUTS);
+        bytes32 allowlistRoot = keccak256(abi.encodePacked(buyer));
+        _setInvite(
+            collection,
+            allowlistRoot,
+            Invite({
+                price: 0.1 ether,
+                start: uint32(block.timestamp),
+                end: 0,
+                limit: 1,
+                maxSupply: 1,
+                unitSize: 1,
+                tokenAddress: address(0),
+                isBlacklist: false
+            })
+        );
+
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(0.01 ether);
+
+        (, uint256 nativeValue,,) = collection.computeMintPayment(allowlistRoot, 1, false);
+        assertEq(nativeValue, 0.1 ether);
+
+        _prank(buyer);
+        collection.mint{value: nativeValue}(_auth(allowlistRoot), 1, address(0), "", _constraints());
+        assertEq(collection.balanceOf(buyer), 1);
+        assertEq(payouts.balance(owner), 0.095 ether);
+        assertEq(payouts.balance(PLATFORM), 0.005 ether);
+    }
+
+    function test_mint_publicErc20InviteChargesNativeMinimumAndRefundsExcess() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        ArchetypePayouts payouts = ArchetypePayouts(PAYOUTS);
+        TestErc20 erc20 = new TestErc20();
+        bytes32 key = keccak256(abi.encodePacked(address(erc20)));
+        _setInvite(
+            collection,
+            key,
+            Invite({
+                price: 1 ether,
+                start: uint32(block.timestamp),
+                end: 0,
+                limit: 2,
+                maxSupply: 2,
+                unitSize: 1,
+                tokenAddress: address(erc20),
+                isBlacklist: false
+            })
+        );
+
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(0.01 ether);
+        _prank(buyer);
+        erc20.mint(2 ether);
+        erc20.approve(address(collection), 2 ether);
+
+        (uint256 currencyCost, uint256 nativeValue,,) = collection.computeMintPayment(key, 2, false);
+        assertEq(currencyCost, 2 ether);
+        assertEq(nativeValue, 0.02 ether);
+
+        vm.txGasPrice(0);
+        uint256 buyerNativeBefore = buyer.balance;
+        MintConstraints memory constraints = _constraints(address(erc20), type(uint128).max, 2);
+        constraints.maxNativeValue = 0.03 ether;
+        collection.mint{value: 0.03 ether}(_auth(key), 2, address(0), "", constraints);
+
+        assertEq(buyerNativeBefore - buyer.balance, 0.02 ether);
+        assertEq(erc20.balanceOf(address(collection)), 0);
+        assertEq(payouts.balanceToken(owner, address(erc20)), 1.9 ether);
+        assertEq(payouts.balanceToken(PLATFORM, address(erc20)), 0.1 ether);
+        assertEq(payouts.balance(PLATFORM), 0.02 ether);
+        assertEq(address(collection).balance, 0);
+    }
+
+    function test_mint_erc20PriceIncreaseAfterQuoteRevertsInsteadOfPullingMore() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        TestErc20 erc20 = new TestErc20();
+        bytes32 key = keccak256(abi.encodePacked(address(erc20)));
+        _setInvite(collection, key, _erc20Invite(address(erc20), 1 ether));
+
+        _prank(buyer);
+        erc20.mint(4 ether);
+        erc20.approve(address(collection), 4 ether);
+
+        (uint256 quotedCost,,,) = collection.computeMintPayment(key, 2, false);
+        assertEq(quotedCost, 2 ether);
+
+        _setInvite(collection, key, _erc20Invite(address(erc20), 1.5 ether));
+
+        _prank(buyer);
+        vm.expectRevert(ExcessiveCurrencyCost.selector);
+        collection.mint(_auth(key), 2, address(0), "", _constraints(address(erc20), uint128(quotedCost), 2));
+
+        assertEq(collection.totalSupply(), 0);
+        assertEq(erc20.balanceOf(buyer), 4 ether);
+        assertEq(erc20.balanceOf(address(collection)), 0);
+        assertEq(ArchetypePayouts(PAYOUTS).balanceToken(owner, address(erc20)), 0);
+
+        _prank(buyer);
+        collection.mint(_auth(key), 2, address(0), "", _constraints(address(erc20), 3 ether, 2));
+
+        assertEq(collection.balanceOf(buyer), 2);
+        assertEq(erc20.balanceOf(buyer), 1 ether);
+    }
+
+    function test_mint_rejectsAChangedPaymentToken() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        TestErc20 quotedToken = new TestErc20();
+        TestErc20 replacementToken = new TestErc20();
+        bytes32 key = keccak256(abi.encodePacked(address(quotedToken)));
+        _setInvite(collection, key, _erc20Invite(address(quotedToken), 1 ether));
+
+        _prank(buyer);
+        replacementToken.mint(1 ether);
+        replacementToken.approve(address(collection), 1 ether);
+        _setInvite(collection, key, _erc20Invite(address(replacementToken), 1 ether));
+
+        _prank(buyer);
+        vm.expectRevert(UnexpectedMintCurrency.selector);
+        collection.mint(_auth(key), 1, address(0), "", _constraints(address(quotedToken), 1 ether, 1));
+
+        assertEq(replacementToken.balanceOf(buyer), 1 ether);
+        assertEq(collection.totalSupply(), 0);
+    }
+
+    function test_mint_rejectsReducedOutput() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        Invite memory invite = _erc20Invite(address(0), 0);
+        invite.unitSize = 2;
+        _setInvite(collection, PUBLIC_KEY, invite);
+        invite.unitSize = 1;
+        _setInvite(collection, PUBLIC_KEY, invite);
+
+        _prank(buyer);
+        vm.expectRevert(InsufficientMintOutput.selector);
+        collection.mint(_publicAuth(), 1, address(0), "", _constraints(address(0), 0, 2));
+
+        assertEq(collection.totalSupply(), 0);
+    }
+
+    function test_createCollection_rejectsPlatformShareBelowFivePercent() public {
+        PayoutConfig memory payoutConfig = defaultPayoutConfig;
+        payoutConfig.ownerBps = 9501;
+        payoutConfig.platformBps = 499;
+
+        _prank(owner);
+        vm.expectRevert(InvalidSplitShares.selector);
+        factory.createCollection(owner, "Pookie", "POOKIE", defaultConfig, payoutConfig);
+    }
+
+    function test_mintTo_rejectsAContractThatCannotReceiveErc721() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        _setPublicInvite(collection, 0, uint32(block.timestamp));
+        NonErc721Receiver receiver = new NonErc721Receiver();
+
+        _prank(buyer);
+        vm.expectRevert(IERC721AUpgradeable.TransferToNonERC721ReceiverImplementer.selector);
+        collection.mintTo(_publicAuth(), 1, address(receiver), address(0), "", _constraints());
+    }
+
+    function test_batchMintTo_erc20PriceIncreaseAfterQuoteRevertsInsteadOfPullingMore() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        TestErc20 erc20 = new TestErc20();
+        bytes32 key = keccak256(abi.encodePacked(address(erc20)));
+        _setInvite(collection, key, _erc20Invite(address(erc20), 1 ether));
+
+        _prank(owner);
+        erc20.mint(4 ether);
+        erc20.approve(address(collection), 4 ether);
+
+        (uint256 quotedCost,,,) = collection.computeMintPayment(key, 2, false);
+
+        _setInvite(collection, key, _erc20Invite(address(erc20), 1.5 ether));
+
+        address[] memory toList = new address[](1);
+        toList[0] = buyer;
+        uint256[] memory quantityList = new uint256[](1);
+        quantityList[0] = 2;
+
+        _prank(owner);
+        vm.expectRevert(ExcessiveCurrencyCost.selector);
+        collection.batchMintTo(
+            _auth(key), _batchMintArgs(toList, quantityList, _constraints(address(erc20), uint128(quotedCost), 2))
+        );
+
+        assertEq(collection.totalSupply(), 0);
+        assertEq(erc20.balanceOf(owner), 4 ether);
+    }
+
+    function test_burnToMint_erc20PriceIncreaseAfterQuoteRevertsInsteadOfPullingMore() public {
+        ArchetypeErc721a nftBurn = _createCollection(owner);
+        vm.warp(block.timestamp + 1);
+        ArchetypeErc721a nftMint = _createCollection(owner);
+        TestErc20 erc20 = new TestErc20();
+        _setBurnInvite(nftBurn, ZERO_KEY, _erc20BurnInvite(nftMint, erc20, 1 ether));
+        _setInvite(
+            nftMint,
+            ZERO_KEY,
+            Invite({
+                price: 0,
+                start: uint32(block.timestamp),
+                end: 0,
+                limit: 5000,
+                maxSupply: 5000,
+                unitSize: 1,
+                tokenAddress: address(0),
+                isBlacklist: false
+            })
+        );
+
+        _mint(nftMint, buyer, _auth(ZERO_KEY), 2, 0);
+        _prank(buyer);
+        nftMint.setApprovalForAll(address(nftBurn), true);
+        _prank(buyer);
+        erc20.mint(4 ether);
+        erc20.approve(address(nftBurn), 4 ether);
+
+        uint256[] memory tokenIds = _rangeTokenIds(1, 2);
+
+        _setBurnInvite(nftBurn, ZERO_KEY, _erc20BurnInvite(nftMint, erc20, 1.5 ether));
+
+        _prank(buyer);
+        vm.expectRevert(ExcessiveCurrencyCost.selector);
+        nftBurn.burnToMint(
+            _auth(ZERO_KEY),
+            tokenIds,
+            _burnConstraints(address(nftMint), DEAD, _constraints(address(erc20), 1 ether, 1))
+        );
+
+        assertEq(nftBurn.totalSupply(), 0);
+        assertEq(nftMint.ownerOf(1), buyer);
+        assertEq(nftMint.ownerOf(2), buyer);
+        assertEq(erc20.balanceOf(buyer), 4 ether);
+        assertEq(erc20.balanceOf(address(nftBurn)), 0);
+        assertEq(ArchetypePayouts(PAYOUTS).balanceToken(owner, address(erc20)), 0);
+    }
+
+    function test_burnToMint_rejectsChangedCollectionAndRecipient() public {
+        ArchetypeErc721a destination = _createCollection(owner);
+        vm.warp(block.timestamp + 1);
+        ArchetypeErc721a expectedSource = _createCollection(owner);
+        vm.warp(block.timestamp + 1);
+        ArchetypeErc721a replacementSource = _createCollection(owner);
+        _setPublicInvite(expectedSource, 0, uint32(block.timestamp));
+        _setPublicInvite(replacementSource, 0, uint32(block.timestamp));
+        _mint(expectedSource, buyer, _publicAuth(), 1, 0);
+        _mint(replacementSource, buyer, _publicAuth(), 1, 0);
+
+        _prank(buyer);
+        expectedSource.setApprovalForAll(address(destination), true);
+        replacementSource.setApprovalForAll(address(destination), true);
+
+        BurnInvite memory invite = BurnInvite({
+            burnErc721: IERC721(address(expectedSource)),
+            burnAddress: DEAD,
+            tokenAddress: address(0),
+            price: 0,
+            reversed: false,
+            ratio: 1,
+            start: uint32(block.timestamp),
+            end: 0,
+            limit: 10
+        });
+        _setBurnInvite(destination, ZERO_KEY, invite);
+        BurnConstraints memory constraints = BurnConstraints({
+            mint: _constraints(address(0), 0, 1), burnCollection: address(expectedSource), burnRecipient: DEAD
+        });
+        uint256[] memory tokenIds = _rangeTokenIds(1, 1);
+
+        invite.burnErc721 = IERC721(address(replacementSource));
+        _setBurnInvite(destination, ZERO_KEY, invite);
+        _prank(buyer);
+        vm.expectRevert(UnexpectedBurnCollection.selector);
+        destination.burnToMint(_auth(ZERO_KEY), tokenIds, constraints);
+
+        invite.burnErc721 = IERC721(address(expectedSource));
+        invite.burnAddress = owner;
+        _setBurnInvite(destination, ZERO_KEY, invite);
+        _prank(buyer);
+        vm.expectRevert(UnexpectedBurnRecipient.selector);
+        destination.burnToMint(_auth(ZERO_KEY), tokenIds, constraints);
+
+        assertEq(expectedSource.ownerOf(1), buyer);
+        assertEq(replacementSource.ownerOf(1), buyer);
+    }
+
+    function test_burnToMint_blocksBurnInviteMutationDuringTransfer() public {
+        ReentrantBurnSource source = new ReentrantBurnSource(buyer);
+        ArchetypeErc721a destination = _createCollection(address(source));
+        source.configure(destination);
+        uint256[] memory tokenIds = _rangeTokenIds(1, 1);
+
+        _prank(buyer);
+        destination.burnToMint(
+            _auth(ZERO_KEY),
+            tokenIds,
+            BurnConstraints({
+                mint: _constraints(address(0), 0, 1), burnCollection: address(source), burnRecipient: DEAD
+            })
+        );
+
+        assertTrue(source.mutationBlocked());
+        assertEq(source.ownerOf(1), DEAD);
+        assertEq(destination.ownerOf(1), buyer);
+    }
+
+    function _erc20Invite(address token, uint128 price) internal view returns (Invite memory) {
+        return Invite({
+            price: price,
+            start: uint32(block.timestamp),
+            end: 0,
+            limit: 100,
+            maxSupply: 100,
+            unitSize: 1,
+            tokenAddress: token,
+            isBlacklist: false
+        });
+    }
+
+    function _erc20BurnInvite(ArchetypeErc721a source, TestErc20 erc20, uint128 price)
+        internal
+        view
+        returns (BurnInvite memory)
+    {
+        return BurnInvite({
+            burnErc721: IERC721(address(source)),
+            burnAddress: DEAD,
+            tokenAddress: address(erc20),
+            price: price,
+            reversed: false,
+            ratio: 1,
+            start: uint32(block.timestamp),
+            end: 0,
+            limit: 100
+        });
+    }
+
+    function test_mint_privateErc20InviteRequiresProofAndHasNoNativeMinimum() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        TestErc20 erc20 = new TestErc20();
+        bytes32 allowlistRoot = keccak256(abi.encodePacked(buyer));
+        Invite memory invite = Invite({
+            price: 1 ether,
+            start: uint32(block.timestamp),
+            end: 0,
+            limit: 10,
+            maxSupply: 10,
+            unitSize: 1,
+            tokenAddress: address(erc20),
+            isBlacklist: false
+        });
+        _setInvite(collection, allowlistRoot, invite);
+
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(0.01 ether);
+        _prank(buyer);
+        erc20.mint(1 ether);
+        erc20.approve(address(collection), 1 ether);
+
+        (uint256 currencyCost, uint256 nativeValue,,) = collection.computeMintPayment(allowlistRoot, 1, false);
+        assertEq(currencyCost, 1 ether);
+        assertEq(nativeValue, 0);
+
+        _prank(other);
+        vm.expectRevert(WalletUnauthorizedToMint.selector);
+        collection.mint(_auth(allowlistRoot), 1, address(0), "", _constraints(address(erc20), type(uint128).max, 1));
+
+        _prank(buyer);
+        collection.mint(_auth(allowlistRoot), 1, address(0), "", _constraints(address(erc20), type(uint128).max, 1));
+        assertEq(collection.balanceOf(buyer), 1);
+        assertEq(ArchetypePayouts(PAYOUTS).balanceToken(owner, address(erc20)), 0.95 ether);
+    }
+
+    function test_mint_acceptsAttributionMarkerAfterCalldata() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+
+        _prank(owner);
+        collection.setInvite(
+            PUBLIC_KEY,
+            CID_ZERO,
+            Invite({
+                price: 0.1 ether,
+                start: uint32(block.timestamp),
+                end: 0,
+                limit: 5000,
+                maxSupply: 5000,
+                unitSize: 1,
+                tokenAddress: address(0),
+                isBlacklist: false
+            })
+        );
+
+        bytes memory markedCalldata = bytes.concat(
+            abi.encodeCall(collection.mint, (_publicAuth(), 1, address(0), "", _constraints())),
+            hex"736361747465722d6d696e742d76310100112233445566778899aabbccddeeff"
+        );
+
+        _prank(buyer);
+        (bool success,) = address(collection).call{value: 0.1 ether}(markedCalldata);
+
+        assertTrue(success);
         assertEq(collection.ownerOf(1), buyer);
         assertEq(collection.totalSupply(), 1);
     }
@@ -238,7 +960,7 @@ contract ArchetypeErc721aTest is Test {
         Auth memory auth = Auth({key: allowlistRoot, proof: proof});
 
         _prank(buyer);
-        collection.mint{value: 0.1 ether}(auth, 1, address(0), "");
+        collection.mint{value: 0.1 ether}(auth, 1, address(0), "", _constraints());
 
         assertEq(collection.ownerOf(1), buyer);
         assertEq(collection.totalSupply(), 1);
@@ -298,7 +1020,7 @@ contract ArchetypeErc721aTest is Test {
 
         _prank(other);
         vm.expectRevert(WalletUnauthorizedToMint.selector);
-        collection.mint{value: 0.1 ether}(auth, 1, address(0), "");
+        collection.mint{value: 0.1 ether}(auth, 1, address(0), "", _constraints());
     }
 
     function test_mint_failsWhenInviteNotYetStarted() public {
@@ -308,7 +1030,7 @@ contract ArchetypeErc721aTest is Test {
 
         _prank(buyer);
         vm.expectRevert(MintNotYetStarted.selector);
-        collection.mint{value: 0.1 ether}(_publicAuth(), 1, address(0), "");
+        collection.mint{value: 0.1 ether}(_publicAuth(), 1, address(0), "", _constraints());
     }
 
     function test_mint_failsWhenInviteEnded() public {
@@ -332,7 +1054,35 @@ contract ArchetypeErc721aTest is Test {
 
         _prank(buyer);
         vm.expectRevert(MintEnded.selector);
-        collection.mint{value: 0.1 ether}(_publicAuth(), 1, address(0), "");
+        collection.mint{value: 0.1 ether}(_publicAuth(), 1, address(0), "", _constraints());
+    }
+
+    function test_setInvite_preservesAnExpiredWindowOnEdit() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        uint32 start = uint32(block.timestamp);
+        uint32 end = start + 1 hours;
+        Invite memory invite = Invite({
+            price: 0.1 ether,
+            start: start,
+            end: end,
+            limit: 5000,
+            maxSupply: 5000,
+            unitSize: 1,
+            tokenAddress: address(0),
+            isBlacklist: false
+        });
+
+        _setInvite(collection, PUBLIC_KEY, invite);
+        vm.warp(end + 1);
+        _setInvite(collection, PUBLIC_KEY, invite);
+
+        (, uint32 storedStart, uint32 storedEnd,,,,,) = collection.invites(PUBLIC_KEY);
+        assertEq(storedStart, start);
+        assertEq(storedEnd, end);
+
+        _prank(buyer);
+        vm.expectRevert(MintEnded.selector);
+        collection.mint{value: 0.1 ether}(_publicAuth(), 1, address(0), "", _constraints());
     }
 
     function test_mint_failsWhenFixedPriceInviteIsUnderpaid() public {
@@ -342,7 +1092,16 @@ contract ArchetypeErc721aTest is Test {
 
         _prank(buyer);
         vm.expectRevert(InsufficientEthSent.selector);
-        collection.mint{value: 0.079 ether}(_publicAuth(), 1, address(0), "");
+        collection.mint{value: 0.079 ether}(_publicAuth(), 1, address(0), "", _constraints());
+    }
+
+    function test_mint_revertsWhenCostExceedsUint128() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        _setPublicInvite(collection, type(uint128).max, uint32(block.timestamp));
+
+        _prank(buyer);
+        vm.expectRevert(MintCostOverflow.selector);
+        collection.mint(_publicAuth(), 2, address(0), "", _constraints());
     }
 
     function test_lockURI_failsWhenCallerIsNotOwner() public {
@@ -398,9 +1157,6 @@ contract ArchetypeErc721aTest is Test {
         _setPublicInvite(collection, 0.2 ether, uint32(block.timestamp));
         _mintPublic(collection, owner, address(0), 0.2 ether);
 
-        _prank(owner);
-        collection.withdraw();
-
         _prank(other);
         vm.expectRevert(NotApprovedToWithdraw.selector);
         payouts.withdrawFrom(owner, alt);
@@ -420,7 +1176,6 @@ contract ArchetypeErc721aTest is Test {
         _mintPublic(collection, owner, address(0), 0.2 ether);
 
         _prank(owner);
-        collection.withdraw();
         payouts.approveWithdrawal(delegate, true);
 
         uint256 delegateBalanceBefore = delegate.balance;
@@ -474,11 +1229,41 @@ contract ArchetypeErc721aTest is Test {
 
         _prank(buyer);
         vm.expectRevert(Blacklisted.selector);
-        collection.mint{value: 0.1 ether}(auth, 1, address(0), "");
+        collection.mint{value: 0.1 ether}(auth, 1, address(0), "", _constraints());
 
         _prank(other);
-        collection.mint{value: 0.1 ether}(auth, 1, address(0), "");
+        collection.mint{value: 0.1 ether}(auth, 1, address(0), "", _constraints());
 
+        assertEq(collection.balanceOf(other), 1);
+    }
+
+    function test_mint_blacklistInviteChargesPublicMinimum() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        bytes32 blacklistRoot = keccak256(abi.encodePacked(buyer));
+        _setInvite(
+            collection,
+            blacklistRoot,
+            Invite({
+                price: 0,
+                start: uint32(block.timestamp),
+                end: 0,
+                limit: 1,
+                maxSupply: 1,
+                unitSize: 1,
+                tokenAddress: address(0),
+                isBlacklist: true
+            })
+        );
+
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(0.01 ether);
+
+        _prank(buyer);
+        vm.expectRevert(Blacklisted.selector);
+        collection.mint{value: 0.01 ether}(_auth(blacklistRoot), 1, address(0), "", _constraints());
+
+        _prank(other);
+        collection.mint{value: 0.01 ether}(_auth(blacklistRoot), 1, address(0), "", _constraints());
         assertEq(collection.balanceOf(other), 1);
     }
 
@@ -492,16 +1277,16 @@ contract ArchetypeErc721aTest is Test {
         uint256 collectionBalanceBefore = address(collection).balance;
 
         _prank(buyer);
-        collection.mint{value: 0.12 ether}(_publicAuth(), 1, address(0), "");
+        collection.mint{value: 0.12 ether}(_publicAuth(), 1, address(0), "", _constraints());
 
-        assertEq(address(collection).balance - collectionBalanceBefore, 0.08 ether);
+        assertEq(address(collection).balance, collectionBalanceBefore);
         assertEq(buyerBalanceBefore - buyer.balance, 0.08 ether);
     }
 
     function test_mint_refundsOverpaymentWithAffiliateAccounting() public {
         ArchetypeErc721a collection = _createCollection(owner);
         address affiliate = makeAddr("affiliate");
-        bytes memory signature = _affiliateSignature(affiliate);
+        bytes memory signature = _affiliateSignature(collection, affiliate);
 
         _setPublicInvite(collection, 0.08 ether, uint32(block.timestamp));
 
@@ -510,44 +1295,153 @@ contract ArchetypeErc721aTest is Test {
         uint256 collectionBalanceBefore = address(collection).balance;
 
         _prank(buyer);
-        collection.mint{value: 0.2 ether}(_publicAuth(), 1, affiliate, signature);
+        collection.mint{value: 0.2 ether}(_publicAuth(), 1, affiliate, signature, _constraints());
 
         // fee breakdown:
         //   mintPrice        = 0.08 ether
-        //   ownerBalance     = 0.08 ether * 8500 / 10000 = 0.068 ether
-        //   affiliateBalance = 0.08 ether * 1500 / 10000 = 0.012 ether
+        //   payoutBalance    = 0.08 ether * 8500 / 10000 = 0.068 ether
+        //   affiliatePayout  = 0.08 ether * 1500 / 10000 = 0.012 ether
         assertEq(buyerBalanceBefore - buyer.balance, 0.08 ether);
-        assertEq(address(collection).balance - collectionBalanceBefore, 0.08 ether);
-        assertEq(collection.ownerBalance(), 0.068 ether);
-        assertEq(collection.affiliateBalance(affiliate), 0.012 ether);
+        assertEq(address(collection).balance, collectionBalanceBefore);
+        assertEq(ArchetypePayouts(PAYOUTS).balance(owner), 0.0646 ether);
+        assertEq(ArchetypePayouts(PAYOUTS).balance(PLATFORM), 0.0034 ether);
+        assertEq(ArchetypePayouts(PAYOUTS).balance(affiliate), 0.012 ether);
     }
 
-    function test_affiliateSignatureValidationAndWithdrawals() public {
+    function test_mint_creditsAffiliateWithoutCallingRecipient() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        ReentrantAffiliate affiliate = new ReentrantAffiliate();
+        bytes32 freeKey = bytes32(uint256(2));
+
+        _setPublicInvite(collection, 0.08 ether, uint32(block.timestamp));
+        _setInvite(
+            collection,
+            freeKey,
+            Invite({
+                price: 0,
+                start: uint32(block.timestamp),
+                end: 0,
+                limit: 5000,
+                maxSupply: 5000,
+                unitSize: 1,
+                tokenAddress: address(0),
+                isBlacklist: false
+            })
+        );
+        affiliate.setCall(
+            address(collection), abi.encodeCall(collection.mint, (_auth(freeKey), 1, address(0), "", _constraints()))
+        );
+
+        _prank(buyer);
+        collection.mint{value: 0.08 ether}(
+            _publicAuth(), 1, address(affiliate), _affiliateSignature(collection, address(affiliate)), _constraints()
+        );
+
+        assertFalse(affiliate.callSucceeded());
+        assertEq(collection.balanceOf(buyer), 1);
+        assertEq(collection.totalSupply(), 1);
+        assertEq(ArchetypePayouts(PAYOUTS).balance(owner), 0.0646 ether);
+        assertEq(ArchetypePayouts(PAYOUTS).balance(PLATFORM), 0.0034 ether);
+        assertEq(ArchetypePayouts(PAYOUTS).balance(address(affiliate)), 0.012 ether);
+        assertEq(address(affiliate).balance, 0);
+    }
+
+    function test_batch_rejectsNonMintCollectionCall() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        ArchetypeBatchV100 batch = ArchetypeBatchV100(BATCH);
+        address[] memory targets = new address[](1);
+        uint256[] memory values = new uint256[](1);
+        bytes[] memory datas = new bytes[](1);
+
+        targets[0] = address(collection);
+        datas[0] = abi.encodeCall(collection.setOwnerAltPayout, (other));
+
+        _prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(ArchetypeBatchV100.UnsupportedMintCall.selector, bytes4(datas[0])));
+        batch.executeBatch(targets, values, datas);
+
+        assertEq(_payoutOwnerAltPayout(collection), address(0));
+    }
+
+    function test_affiliateAuthorizationIsBoundToCollectionAndMinter() public {
+        ArchetypeErc721a first = _createCollection(owner);
+        vm.warp(block.timestamp + 1);
+        ArchetypeErc721a second = _createCollection(owner);
+        address affiliate = makeAddr("affiliate");
+        bytes memory firstAuthorization = _affiliateSignature(first, affiliate);
+
+        _setPublicInvite(first, 0.08 ether, uint32(block.timestamp));
+        _setPublicInvite(second, 0.08 ether, uint32(block.timestamp));
+
+        _prank(buyer);
+        vm.expectRevert(InvalidAffiliateAuthorization.selector);
+        second.mint{value: 0.08 ether}(_publicAuth(), 1, affiliate, firstAuthorization, _constraints());
+
+        bytes memory otherMinterAuthorization =
+            _affiliateSignatureFor(first, affiliate, other, block.timestamp + 1 hours, AFFILIATE_SIGNER_PK);
+        _prank(buyer);
+        vm.expectRevert(InvalidAffiliateAuthorization.selector);
+        first.mint{value: 0.08 ether}(_publicAuth(), 1, affiliate, otherMinterAuthorization, _constraints());
+    }
+
+    function test_affiliateAuthorizationExpires() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        address affiliate = makeAddr("affiliate");
+        bytes memory authorization =
+            _affiliateSignatureFor(collection, affiliate, buyer, block.timestamp + 1 hours, AFFILIATE_SIGNER_PK);
+
+        _setPublicInvite(collection, 0.08 ether, uint32(block.timestamp));
+        vm.warp(block.timestamp + 1 hours + 1);
+
+        _prank(buyer);
+        vm.expectRevert(ExpiredAffiliateAuthorization.selector);
+        collection.mint{value: 0.08 ether}(_publicAuth(), 1, affiliate, authorization, _constraints());
+    }
+
+    function test_affiliateSignerRegistryUpdatesCollectionValidation() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        address affiliate = makeAddr("affiliate");
+        _setPublicInvite(collection, 0.08 ether, uint32(block.timestamp));
+        bytes memory oldAuthorization = _affiliateSignature(collection, affiliate);
+
+        _prank(owner);
+        affiliateSignerRegistry.setAffiliateSigner(vm.addr(WRONG_AFFILIATE_SIGNER_PK));
+
+        _prank(buyer);
+        vm.expectRevert(InvalidAffiliateAuthorization.selector);
+        collection.mint{value: 0.08 ether}(_publicAuth(), 1, affiliate, oldAuthorization, _constraints());
+
+        bytes memory newAuthorization =
+            _affiliateSignatureFor(collection, affiliate, buyer, block.timestamp + 1 hours, WRONG_AFFILIATE_SIGNER_PK);
+        _prank(buyer);
+        collection.mint{value: 0.08 ether}(_publicAuth(), 1, affiliate, newAuthorization, _constraints());
+
+        assertEq(collection.ownerOf(1), buyer);
+    }
+
+    function test_affiliateSignatureValidationAndPayoutCredits() public {
         ArchetypeErc721a collection = _createCollection(owner);
         ArchetypePayouts payouts = ArchetypePayouts(PAYOUTS);
         address affiliate = makeAddr("affiliate");
-        bytes memory invalidSignature = _affiliateSignatureWithPk(affiliate, WRONG_AFFILIATE_SIGNER_PK);
-        bytes memory validSignature = _affiliateSignature(affiliate);
+        bytes memory invalidSignature =
+            _affiliateSignatureFor(collection, affiliate, buyer, block.timestamp + 1 hours, WRONG_AFFILIATE_SIGNER_PK);
+        bytes memory validSignature = _affiliateSignature(collection, affiliate);
         address[] memory tokens = _nativeTokenList();
 
         _setPublicInvite(collection, 0.08 ether, uint32(block.timestamp));
 
         _prank(buyer);
-        vm.expectRevert(InvalidSignature.selector);
-        collection.mint{value: 0.08 ether}(_publicAuth(), 1, affiliate, invalidSignature);
+        vm.expectRevert(InvalidAffiliateAuthorization.selector);
+        collection.mint{value: 0.08 ether}(_publicAuth(), 1, affiliate, invalidSignature, _constraints());
 
         _prank(buyer);
-        collection.mint{value: 0.08 ether}(_publicAuth(), 1, affiliate, validSignature);
+        collection.mint{value: 0.08 ether}(_publicAuth(), 1, affiliate, validSignature, _constraints());
 
         // fee breakdown:
         //   mintPrice        = 0.08 ether
-        //   ownerBalance     = 0.08 ether * 8500 / 10000 = 0.068 ether
-        //   affiliateBalance = 0.08 ether * 1500 / 10000 = 0.012 ether
-        assertEq(collection.ownerBalance(), 0.068 ether);
-        assertEq(collection.affiliateBalance(affiliate), 0.012 ether);
-
-        _prank(owner);
-        collection.withdraw();
+        //   payoutBalance    = 0.08 ether * 8500 / 10000 = 0.068 ether
+        //   affiliatePayout  = 0.08 ether * 1500 / 10000 = 0.012 ether
+        assertEq(payouts.balance(affiliate), 0.012 ether);
 
         // fee breakdown:
         //   ownerBalance   = 0.068 ether
@@ -563,15 +1457,12 @@ contract ArchetypeErc721aTest is Test {
         assertEq(owner.balance - ownerBalanceBefore, 0.0646 ether);
 
         _prank(buyer);
-        collection.mint{value: 0.08 ether}(_publicAuth(), 1, affiliate, validSignature);
+        collection.mint{value: 0.08 ether}(_publicAuth(), 1, affiliate, validSignature, _constraints());
         // fee breakdown:
-        //   firstAffiliateCredit  = 0.08 ether * 1500 / 10000 = 0.012 ether
-        //   secondAffiliateCredit = 0.08 ether * 1500 / 10000 = 0.012 ether
-        //   totalAffiliateBalance = 0.012 ether * 2 = 0.024 ether
-        assertEq(collection.affiliateBalance(affiliate), 0.024 ether);
-
-        _prank(PLATFORM);
-        collection.withdraw();
+        //   firstAffiliatePayout  = 0.08 ether * 1500 / 10000 = 0.012 ether
+        //   secondAffiliatePayout = 0.08 ether * 1500 / 10000 = 0.012 ether
+        //   totalAffiliatePayout  = 0.012 ether * 2 = 0.024 ether
+        assertEq(payouts.balance(affiliate), 0.024 ether);
 
         // fee breakdown:
         //   previousPlatformPayout = 0.0034 ether
@@ -579,6 +1470,11 @@ contract ArchetypeErc721aTest is Test {
         //   totalPlatformPayout    = 0.0034 ether * 2 = 0.0068 ether
         assertEq(payouts.balance(owner), 0.0646 ether);
         assertEq(payouts.balance(PLATFORM), 0.0068 ether);
+
+        uint256 affiliateBalanceBefore = affiliate.balance;
+        _prank(affiliate);
+        payouts.withdraw();
+        assertEq(affiliate.balance - affiliateBalanceBefore, 0.024 ether);
 
         ownerBalanceBefore = owner.balance;
         _prank(owner);
@@ -590,23 +1486,6 @@ contract ArchetypeErc721aTest is Test {
         payouts.withdraw();
         assertEq(PLATFORM.balance - platformBalanceBefore, 0.0068 ether);
 
-        _prank(affiliate);
-        vm.expectRevert(NotShareholder.selector);
-        collection.withdraw();
-
-        uint256 affiliateBalanceBefore = affiliate.balance;
-        _prank(affiliate);
-        collection.withdrawAffiliate();
-        // fee breakdown:
-        //   firstAffiliateCredit  = 0.08 ether * 1500 / 10000 = 0.012 ether
-        //   secondAffiliateCredit = 0.08 ether * 1500 / 10000 = 0.012 ether
-        //   affiliatePayout       = 0.012 ether * 2 = 0.024 ether
-        assertEq(affiliate.balance - affiliateBalanceBefore, 0.024 ether);
-
-        _prank(affiliate);
-        vm.expectRevert(BalanceEmpty.selector);
-        collection.withdrawAffiliate();
-
         _prank(owner);
         vm.expectRevert(PayoutBalanceEmpty.selector);
         payouts.withdraw();
@@ -614,14 +1493,6 @@ contract ArchetypeErc721aTest is Test {
         _prank(PLATFORM);
         vm.expectRevert(PayoutBalanceEmpty.selector);
         payouts.withdrawTokens(tokens);
-    }
-
-    function test_withdrawAffiliate_failsWhenWalletNeverEarnedAffiliateBalance() public {
-        ArchetypeErc721a collection = _createCollection(owner);
-
-        _prank(other);
-        vm.expectRevert(BalanceEmpty.selector);
-        collection.withdrawAffiliate();
     }
 
     function test_burnToMint_basicFunctionality() public {
@@ -668,18 +1539,18 @@ contract ArchetypeErc721aTest is Test {
         uint256[] memory tokenIds = _rangeTokenIds(9, 2);
         _prank(buyer);
         vm.expectRevert(NotTokenOwner.selector);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds, _burnConstraints(address(nftMint), DEAD, _constraints()));
 
         tokenIds = _rangeTokenIds(9, 1);
         _prank(buyer);
         vm.expectRevert(InvalidAmountOfTokens.selector);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds, _burnConstraints(address(nftMint), DEAD, _constraints()));
 
         tokenIds = new uint256[](2);
         tokenIds[0] = 2;
         tokenIds[1] = 4;
         _prank(buyer);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds, _burnConstraints(address(nftMint), DEAD, _constraints()));
 
         tokenIds = new uint256[](4);
         tokenIds[0] = 1;
@@ -687,7 +1558,7 @@ contract ArchetypeErc721aTest is Test {
         tokenIds[2] = 5;
         tokenIds[3] = 8;
         _prank(buyer);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds, _burnConstraints(address(nftMint), DEAD, _constraints()));
 
         _setBurnInvite(
             nftBurn,
@@ -707,7 +1578,7 @@ contract ArchetypeErc721aTest is Test {
         tokenIds = _rangeTokenIds(11, 2);
         _prank(buyer);
         vm.expectRevert(MintingPaused.selector);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds, _burnConstraints(address(nftMint), DEAD, _constraints()));
 
         _setBurnInvite(
             nftBurn,
@@ -726,7 +1597,7 @@ contract ArchetypeErc721aTest is Test {
         );
         _prank(buyer);
         vm.expectRevert(MintNotYetStarted.selector);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds, _burnConstraints(address(nftMint), DEAD, _constraints()));
 
         _setBurnInvite(
             nftBurn,
@@ -744,7 +1615,7 @@ contract ArchetypeErc721aTest is Test {
             })
         );
         _prank(buyer);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds, _burnConstraints(address(nftMint), DEAD, _constraints()));
 
         tokenIds = _rangeTokenIds(7, 1);
         _setBurnInvite(
@@ -763,7 +1634,7 @@ contract ArchetypeErc721aTest is Test {
             })
         );
         _prank(buyer);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds, _burnConstraints(address(nftMint), DEAD, _constraints()));
 
         assertEq(nftMint.ownerOf(1), DEAD);
         assertEq(nftMint.ownerOf(2), DEAD);
@@ -824,16 +1695,72 @@ contract ArchetypeErc721aTest is Test {
 
         uint256[] memory tokenIds = _rangeTokenIds(1, 2);
         _prank(buyer);
-        nftBurn.burnToMint{value: 0.05 ether}(_auth(allowlistRoot), tokenIds);
+        nftBurn.burnToMint{value: 0.05 ether}(
+            _auth(allowlistRoot), tokenIds, _burnConstraints(address(nftMint), DEAD, _constraints())
+        );
 
         _prank(other);
         vm.expectRevert(WalletUnauthorizedToMint.selector);
-        nftBurn.burnToMint{value: 0.05 ether}(_auth(allowlistRoot), _rangeTokenIds(5, 2));
+        nftBurn.burnToMint{value: 0.05 ether}(
+            _auth(allowlistRoot), _rangeTokenIds(5, 2), _burnConstraints(address(nftMint), DEAD, _constraints())
+        );
 
         assertEq(nftMint.ownerOf(1), DEAD);
         assertEq(nftMint.ownerOf(2), DEAD);
         assertEq(nftMint.balanceOf(buyer), 2);
         assertEq(nftBurn.balanceOf(buyer), 4);
+    }
+
+    function test_burnToMint_publicListHasNoMinimumFee() public {
+        ArchetypeErc721a nftBurn = _createCollection(owner);
+        vm.warp(block.timestamp + 1);
+        ArchetypeErc721a nftMint = _createCollection(owner);
+
+        _setInvite(
+            nftMint,
+            ZERO_KEY,
+            Invite({
+                price: 0,
+                start: uint32(block.timestamp),
+                end: 0,
+                limit: 5000,
+                maxSupply: 5000,
+                unitSize: 1,
+                tokenAddress: address(0),
+                isBlacklist: false
+            })
+        );
+        _setBurnInvite(
+            nftBurn,
+            ZERO_KEY,
+            BurnInvite({
+                burnErc721: IERC721(address(nftMint)),
+                burnAddress: DEAD,
+                tokenAddress: address(0),
+                price: 0.1 ether,
+                reversed: true,
+                ratio: 2,
+                start: uint32(block.timestamp),
+                end: 0,
+                limit: 5000
+            })
+        );
+        _mint(nftMint, buyer, _auth(ZERO_KEY), 1, 0);
+
+        _prank(buyer);
+        nftMint.setApprovalForAll(address(nftBurn), true);
+        _prank(owner);
+        mintFeeRegistry.setNativeMinimumFee(1 ether);
+
+        _prank(buyer);
+        nftBurn.burnToMint{value: 0.1 ether}(
+            _auth(ZERO_KEY), _rangeTokenIds(1, 1), _burnConstraints(address(nftMint), DEAD, _constraints())
+        );
+
+        assertEq(nftBurn.balanceOf(buyer), 2);
+        assertEq(nftMint.ownerOf(1), DEAD);
+        assertEq(ArchetypePayouts(PAYOUTS).balance(owner), 0.095 ether);
+        assertEq(ArchetypePayouts(PAYOUTS).balance(PLATFORM), 0.005 ether);
     }
 
     function test_burnToMint_erc20PaymentAndSelfBurn() public {
@@ -881,17 +1808,28 @@ contract ArchetypeErc721aTest is Test {
 
         uint256[] memory tokenIds = _rangeTokenIds(1, 2);
         _prank(buyer);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(
+            _auth(ZERO_KEY),
+            tokenIds,
+            _burnConstraints(address(nftBurn), DEAD, _constraints(address(erc20), type(uint128).max, 1))
+        );
 
         assertEq(nftBurn.balanceOf(buyer), 3);
         assertEq(erc20.balanceOf(buyer), 10 ether);
-        assertEq(erc20.balanceOf(address(nftBurn)), 10 ether);
+        assertEq(erc20.balanceOf(address(nftBurn)), 0);
+        assertEq(ArchetypePayouts(PAYOUTS).balanceToken(owner, address(erc20)), 9.5 ether);
+        assertEq(ArchetypePayouts(PAYOUTS).balanceToken(PLATFORM, address(erc20)), 0.5 ether);
+        assertEq(ArchetypePayouts(PAYOUTS).balance(PLATFORM), 0.2 ether);
         assertEq(nftBurn.ownerOf(1), DEAD);
         assertEq(nftBurn.ownerOf(2), DEAD);
 
         _prank(buyer);
         vm.expectRevert(NotTokenOwner.selector);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(
+            _auth(ZERO_KEY),
+            tokenIds,
+            _burnConstraints(address(nftBurn), DEAD, _constraints(address(erc20), type(uint128).max, 1))
+        );
     }
 
     function test_maxSupply_checksMintAndBurnToMint() public {
@@ -949,7 +1887,7 @@ contract ArchetypeErc721aTest is Test {
 
         _prank(buyer);
         vm.expectRevert(MaxSupplyExceeded.selector);
-        nftMint.mint(_auth(ZERO_KEY), 4991, address(0), "");
+        nftMint.mint(_auth(ZERO_KEY), 4991, address(0), "", _constraints());
 
         _mint(nftMint, buyer, _auth(ZERO_KEY), 4989, 0);
         discounts[0] = BonusDiscount({numMints: 1, numBonusMints: 1});
@@ -958,7 +1896,7 @@ contract ArchetypeErc721aTest is Test {
 
         _prank(buyer);
         vm.expectRevert(MaxSupplyExceeded.selector);
-        nftMint.mint(_auth(ZERO_KEY), 1, address(0), "");
+        nftMint.mint(_auth(ZERO_KEY), 1, address(0), "", _constraints());
 
         BonusDiscount[] memory emptyDiscounts = new BonusDiscount[](0);
         _prank(owner);
@@ -967,7 +1905,7 @@ contract ArchetypeErc721aTest is Test {
 
         _prank(buyer);
         vm.expectRevert(MaxSupplyExceeded.selector);
-        nftMint.mint(_auth(ZERO_KEY), 1, address(0), "");
+        nftMint.mint(_auth(ZERO_KEY), 1, address(0), "", _constraints());
 
         _mint(nftBurn, buyer, _auth(ZERO_KEY), 4990, 0);
         _prank(buyer);
@@ -976,16 +1914,16 @@ contract ArchetypeErc721aTest is Test {
         uint256[] memory tokenIds = _rangeTokenIds(1, 40);
         _prank(buyer);
         vm.expectRevert(MaxSupplyExceeded.selector);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds, _burnConstraints(address(nftMint), DEAD, _constraints()));
 
         tokenIds = _rangeTokenIds(1, 20);
         _prank(buyer);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds, _burnConstraints(address(nftMint), DEAD, _constraints()));
 
         tokenIds = _rangeTokenIds(21, 2);
         _prank(buyer);
         vm.expectRevert(MaxSupplyExceeded.selector);
-        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds);
+        nftBurn.burnToMint(_auth(ZERO_KEY), tokenIds, _burnConstraints(address(nftMint), DEAD, _constraints()));
 
         assertEq(nftBurn.totalSupply(), 5000);
         assertEq(nftMint.totalSupply(), 5000);
@@ -1013,7 +1951,7 @@ contract ArchetypeErc721aTest is Test {
 
         _prank(other);
         vm.expectRevert(ListMaxSupplyExceeded.selector);
-        collection.mint(_auth(ZERO_KEY), 60, address(0), "");
+        collection.mint(_auth(ZERO_KEY), 60, address(0), "", _constraints());
 
         _mint(collection, other, _auth(ZERO_KEY), 50, 0);
 
@@ -1096,13 +2034,13 @@ contract ArchetypeErc721aTest is Test {
 
         _prank(buyer);
         vm.expectRevert(NumberOfMintsExceeded.selector);
-        collection.mint(_auth(ZERO_KEY), 2, address(0), "");
+        collection.mint(_auth(ZERO_KEY), 2, address(0), "", _constraints());
 
         _mint(collection, other, _auth(ZERO_KEY), 2, 0);
 
         _prank(owner);
         vm.expectRevert(ListMaxSupplyExceeded.selector);
-        collection.mint(_auth(ZERO_KEY), 1, address(0), "");
+        collection.mint(_auth(ZERO_KEY), 1, address(0), "", _constraints());
 
         assertEq(collection.balanceOf(buyer), 12);
         assertEq(collection.balanceOf(other), 24);
@@ -1149,26 +2087,22 @@ contract ArchetypeErc721aTest is Test {
 
         _prank(buyer);
         vm.expectRevert(NotApprovedToTransfer.selector);
-        collection.mint(_auth(erc20Key), 3, address(0), "");
+        collection.mint(_auth(erc20Key), 3, address(0), "", _constraints(address(erc20), type(uint128).max, 3));
 
         _prank(buyer);
         erc20.approve(address(collection), type(uint256).max);
         _prank(buyer);
         vm.expectRevert(Erc20BalanceTooLow.selector);
-        collection.mint(_auth(erc20Key), 3, address(0), "");
+        collection.mint(_auth(erc20Key), 3, address(0), "", _constraints(address(erc20), type(uint128).max, 3));
 
         _prank(buyer);
         erc20.mint(3 ether);
         _prank(buyer);
-        collection.mint(_auth(erc20Key), 3, address(0), "");
+        collection.mint(_auth(erc20Key), 3, address(0), "", _constraints(address(erc20), type(uint128).max, 3));
 
         assertEq(collection.balanceOf(buyer), 3);
         assertEq(erc20.balanceOf(buyer), 0);
-        assertEq(erc20.balanceOf(address(collection)), 3 ether);
-        assertEq(collection.ownerBalanceToken(address(erc20)), 3 ether);
-
-        _prank(owner);
-        collection.withdrawTokens(tokens);
+        assertEq(erc20.balanceOf(address(collection)), 0);
         assertEq(erc20.balanceOf(PAYOUTS), 3 ether);
 
         _prank(owner);
@@ -1185,106 +2119,134 @@ contract ArchetypeErc721aTest is Test {
         assertEq(erc20.balanceOf(PLATFORM), 0.15 ether);
     }
 
-    function test_mint_descendingDutchInvite() public {
+    function test_mint_rejectsFeeOnTransferErc20() public {
         ArchetypeErc721a collection = _createCollection(owner);
+        FeeOnTransferErc20 erc20 = new FeeOnTransferErc20();
+        bytes32 erc20Key = keccak256(abi.encodePacked(address(erc20)));
 
-        _setAdvancedInvite(
+        _setInvite(
             collection,
-            ZERO_KEY,
-            AdvancedInvite({
+            erc20Key,
+            Invite({
                 price: 1 ether,
-                reservePrice: 0.1 ether,
-                delta: 0.1 ether,
                 start: uint32(block.timestamp),
                 end: 0,
                 limit: 5000,
                 maxSupply: 5000,
-                interval: 1000,
                 unitSize: 1,
-                tokenAddress: address(0),
+                tokenAddress: address(erc20),
                 isBlacklist: false
             })
         );
 
+        erc20.mint(buyer, 1 ether);
         _prank(buyer);
-        vm.expectRevert(InsufficientEthSent.selector);
-        collection.mint{value: 0.5 ether}(_auth(ZERO_KEY), 1, address(0), "");
+        erc20.approve(address(collection), type(uint256).max);
 
-        _mint(collection, buyer, _auth(ZERO_KEY), 1, 1 ether);
-        vm.warp(block.timestamp + 5000);
-        _mint(collection, buyer, _auth(ZERO_KEY), 1, 0.5 ether);
-        vm.warp(block.timestamp + 50000);
-        _mint(collection, buyer, _auth(ZERO_KEY), 1, 0.1 ether);
+        _prank(buyer);
+        vm.expectRevert(UnexpectedTokenBalanceChange.selector);
+        collection.mint(_auth(erc20Key), 1, address(0), "", _constraints(address(erc20), type(uint128).max, 1));
 
-        assertEq(collection.balanceOf(buyer), 3);
+        assertEq(collection.totalSupply(), 0);
+        assertEq(erc20.balanceOf(buyer), 1 ether);
+        assertEq(erc20.balanceOf(address(collection)), 0);
+        assertEq(erc20.balanceOf(PAYOUTS), 0);
     }
 
-    function test_mint_increasingDutchInvite() public {
+    function test_mint_noReturnErc20PricedInvite() public {
         ArchetypeErc721a collection = _createCollection(owner);
+        ArchetypePayouts payouts = ArchetypePayouts(PAYOUTS);
+        NoReturnErc20 erc20 = new NoReturnErc20();
+        address affiliate = makeAddr("affiliate");
+        bytes32 erc20Key = keccak256(abi.encodePacked(address(erc20)));
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(erc20);
 
-        _setAdvancedInvite(
-            collection,
-            ZERO_KEY,
-            AdvancedInvite({
-                price: 1 ether,
-                reservePrice: 10 ether,
-                delta: 1 ether,
-                start: uint32(block.timestamp),
-                end: 0,
-                limit: 5000,
-                maxSupply: 5000,
-                interval: 1000,
-                unitSize: 1,
-                tokenAddress: address(0),
-                isBlacklist: false
-            })
-        );
+        Invite memory invite = Invite({
+            price: 1 ether,
+            start: uint32(block.timestamp),
+            end: 0,
+            limit: 5000,
+            maxSupply: 5000,
+            unitSize: 1,
+            tokenAddress: address(erc20),
+            isBlacklist: false
+        });
+        _setInvite(collection, erc20Key, invite);
+        _setInvite(collection, erc20Key, invite);
 
-        _mint(collection, buyer, _auth(ZERO_KEY), 1, 1 ether);
-        vm.warp(block.timestamp + 5000);
-
+        erc20.mint(buyer, 3 ether);
         _prank(buyer);
-        vm.expectRevert(InsufficientEthSent.selector);
-        collection.mint{value: 1 ether}(_auth(ZERO_KEY), 1, address(0), "");
-
-        _mint(collection, buyer, _auth(ZERO_KEY), 1, 6 ether);
-        vm.warp(block.timestamp + 50000);
-        _mint(collection, buyer, _auth(ZERO_KEY), 1, 10 ether);
+        erc20.approve(address(collection), type(uint256).max);
+        collection.mint(
+            _auth(erc20Key),
+            3,
+            affiliate,
+            _affiliateSignature(collection, affiliate),
+            _constraints(address(erc20), type(uint128).max, 3)
+        );
 
         assertEq(collection.balanceOf(buyer), 3);
+        assertEq(erc20.balanceOf(address(collection)), 0);
+        assertEq(payouts.balanceToken(affiliate, address(erc20)), 0.45 ether);
+        _prank(owner);
+        payouts.withdrawTokens(tokens);
+
+        _prank(PLATFORM);
+        payouts.withdrawTokens(tokens);
+
+        _prank(affiliate);
+        payouts.withdrawTokens(tokens);
+
+        assertEq(erc20.balanceOf(owner), 2.4225 ether);
+        assertEq(erc20.balanceOf(PLATFORM), 0.1275 ether);
+        assertEq(erc20.balanceOf(affiliate), 0.45 ether);
     }
 
-    function test_mint_linearPricingCurve() public {
+    function test_setBurnInvite_reapprovesZeroFirstErc20() public {
         ArchetypeErc721a collection = _createCollection(owner);
+        NoReturnErc20 erc20 = new NoReturnErc20();
+        BurnInvite memory invite = BurnInvite({
+            burnErc721: IERC721(address(collection)),
+            burnAddress: DEAD,
+            tokenAddress: address(erc20),
+            price: 1 ether,
+            reversed: false,
+            ratio: 1,
+            start: uint32(block.timestamp),
+            end: 0,
+            limit: 5000
+        });
 
-        _setAdvancedInvite(
-            collection,
-            ZERO_KEY,
-            AdvancedInvite({
-                price: 1 ether,
-                reservePrice: 0.1 ether,
-                delta: 0.01 ether,
-                start: uint32(block.timestamp),
-                end: 0,
-                limit: 5000,
-                maxSupply: 5000,
-                interval: 0,
-                unitSize: 1,
-                tokenAddress: address(0),
-                isBlacklist: false
-            })
-        );
+        _setBurnInvite(collection, ZERO_KEY, invite);
+        _setBurnInvite(collection, ZERO_KEY, invite);
 
-        _mint(collection, buyer, _auth(ZERO_KEY), 1, 1 ether);
+        assertEq(erc20.allowance(address(collection), PAYOUTS), type(uint256).max);
+    }
 
-        _prank(buyer);
-        vm.expectRevert(InsufficientEthSent.selector);
-        collection.mint{value: 1 ether}(_auth(ZERO_KEY), 1, address(0), "");
+    function test_setBurnInvite_preservesAnExpiredWindowOnEdit() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        uint32 start = uint32(block.timestamp);
+        uint32 end = start + 1 hours;
+        BurnInvite memory invite = BurnInvite({
+            burnErc721: IERC721(address(collection)),
+            burnAddress: DEAD,
+            tokenAddress: address(0),
+            price: 0,
+            reversed: false,
+            ratio: 1,
+            start: start,
+            end: end,
+            limit: 5000
+        });
 
-        _mint(collection, buyer, _auth(ZERO_KEY), 1, 1.01 ether);
-        _mint(collection, buyer, _auth(ZERO_KEY), 10, 10.65 ether);
+        _setBurnInvite(collection, ZERO_KEY, invite);
+        vm.warp(end + 1);
+        _setBurnInvite(collection, ZERO_KEY, invite);
 
-        assertEq(collection.balanceOf(buyer), 12);
+        (,,,,,, uint32 storedStart, uint32 storedEnd,) = collection.burnInvites(ZERO_KEY);
+        assertEq(storedStart, start);
+        assertEq(storedEnd, end);
     }
 
     function test_mint_bonusDiscountsAndAffiliateDiscounts() public {
@@ -1294,7 +2256,7 @@ contract ArchetypeErc721aTest is Test {
         config.affiliateDiscount = 1000;
         ArchetypeErc721a collection = _createCollectionWithConfig(owner, config);
         address affiliate = makeAddr("affiliate");
-        bytes memory signature = _affiliateSignature(affiliate);
+        bytes memory signature = _affiliateSignature(collection, affiliate);
         BonusDiscount[] memory discounts = new BonusDiscount[](3);
 
         discounts[0] = BonusDiscount({numMints: 20, numBonusMints: 10});
@@ -1305,15 +2267,12 @@ contract ArchetypeErc721aTest is Test {
         collection.setBonusInvite(
             ZERO_KEY,
             CID_ZERO,
-            AdvancedInvite({
+            Invite({
                 price: 0.01 ether,
-                reservePrice: 0.01 ether,
-                delta: 0,
                 start: uint32(block.timestamp),
                 end: 0,
                 limit: 300,
                 maxSupply: defaultConfig.maxSupply,
-                interval: 0,
                 unitSize: 1,
                 tokenAddress: address(0),
                 isBlacklist: false
@@ -1322,26 +2281,25 @@ contract ArchetypeErc721aTest is Test {
         );
 
         _prank(buyer);
-        collection.mint{value: 0.027 ether}(_auth(ZERO_KEY), 3, affiliate, signature);
+        collection.mint{value: 0.027 ether}(_auth(ZERO_KEY), 3, affiliate, signature, _constraints());
 
         assertEq(collection.ownerOf(4), buyer);
         assertEq(collection.totalSupply(), 4);
 
         _prank(buyer);
-        collection.mint{value: 0.08 ether}(_auth(ZERO_KEY), 8, address(0), "");
+        collection.mint{value: 0.08 ether}(_auth(ZERO_KEY), 8, address(0), "", _constraints());
 
         assertEq(collection.totalSupply(), 14);
 
         _prank(buyer);
-        collection.mint{value: 0.21 ether}(_auth(ZERO_KEY), 21, address(0), "");
+        collection.mint{value: 0.21 ether}(_auth(ZERO_KEY), 21, address(0), "", _constraints());
 
         assertEq(collection.totalSupply(), 45);
     }
 
-    function test_withdraw_splitsWithSuperAffiliate() public {
+    function test_mint_creditsSuperAffiliatePayout() public {
         address affiliate = makeAddr("affiliate");
         address superAffiliate = makeAddr("superAffiliate");
-        bytes memory signature = _affiliateSignature(affiliate);
         PayoutConfig memory payoutConfig = PayoutConfig({
             ownerBps: 9000,
             platformBps: 500,
@@ -1353,8 +2311,8 @@ contract ArchetypeErc721aTest is Test {
         });
         ArchetypeErc721a collection = _createCollectionWithPayout(owner, defaultConfig, payoutConfig);
         ArchetypePayouts payouts = ArchetypePayouts(PAYOUTS);
+        bytes memory signature = _affiliateSignature(collection, affiliate);
 
-        vm.deal(affiliate, 100 ether);
         vm.deal(superAffiliate, 100 ether);
 
         _setInvite(
@@ -1373,17 +2331,13 @@ contract ArchetypeErc721aTest is Test {
         );
 
         _prank(buyer);
-        collection.mint{value: 0.1 ether}(_auth(ZERO_KEY), 1, affiliate, signature);
+        collection.mint{value: 0.1 ether}(_auth(ZERO_KEY), 1, affiliate, signature, _constraints());
 
         // fee breakdown:
         //   mintPrice        = 0.1 ether
-        //   ownerBalance     = 0.1 ether * 8500 / 10000 = 0.085 ether
-        //   affiliateBalance = 0.1 ether * 1500 / 10000 = 0.015 ether
-        assertEq(collection.ownerBalance(), 0.085 ether);
-        assertEq(collection.affiliateBalance(affiliate), 0.015 ether);
-
-        _prank(owner);
-        collection.withdraw();
+        //   payoutBalance    = 0.1 ether * 8500 / 10000 = 0.085 ether
+        //   affiliatePayout  = 0.1 ether * 1500 / 10000 = 0.015 ether
+        assertEq(payouts.balance(affiliate), 0.015 ether);
 
         // fee breakdown:
         //   ownerBalance         = 0.085 ether
@@ -1410,14 +2364,9 @@ contract ArchetypeErc721aTest is Test {
         _prank(superAffiliate);
         payouts.withdraw();
         assertEq(superAffiliate.balance - superAffiliateBalanceBefore, 0.00425 ether);
-
-        uint256 affiliateBalanceBefore = affiliate.balance;
-        _prank(affiliate);
-        collection.withdrawAffiliate();
-        assertEq(affiliate.balance - affiliateBalanceBefore, 0.015 ether);
     }
 
-    function test_withdraw_usesOwnerAltPayout() public {
+    function test_mint_usesOwnerAltPayout() public {
         address altPayout = makeAddr("altPayout");
         PayoutConfig memory payoutConfig = PayoutConfig({
             ownerBps: 9000,
@@ -1449,29 +2398,22 @@ contract ArchetypeErc721aTest is Test {
         );
 
         _mint(collection, other, _auth(ZERO_KEY), 1, 0.1 ether);
-        assertEq(collection.ownerBalance(), 0.1 ether);
 
         vm.txGasPrice(0);
         uint256 altBalanceBefore = altPayout.balance;
-
-        _prank(owner);
-        collection.withdraw();
 
         // fee breakdown:
         //   ownerBalance   = 0.1 ether
         //   altPayout      = 0.1 ether * 9000 / 10000 = 0.09 ether
         //   platformPayout = 0.1 ether * 500 / 10000  = 0.005 ether
         //   partnerPayout  = 0.1 ether * 500 / 10000  = 0.005 ether
-        assertEq(altPayout.balance - altBalanceBefore, 0.09 ether);
+        assertEq(altPayout.balance, altBalanceBefore);
         assertEq(payouts.balance(owner), 0);
-        assertEq(payouts.balance(altPayout), 0);
+        assertEq(payouts.balance(altPayout), 0.09 ether);
         assertEq(payouts.balance(PLATFORM), 0.005 ether);
         assertEq(payouts.balance(buyer), 0.005 ether);
 
         _mint(collection, other, _auth(ZERO_KEY), 1, 0.1 ether);
-
-        _prank(altPayout);
-        collection.withdraw();
 
         // fee breakdown:
         //   previousAltPayout      = 0.09 ether
@@ -1479,16 +2421,46 @@ contract ArchetypeErc721aTest is Test {
         //   totalAltPayout         = 0.09 ether * 2 = 0.18 ether
         //   totalPlatformPayout    = 0.005 ether * 2 = 0.01 ether
         //   totalPartnerPayout     = 0.005 ether * 2 = 0.01 ether
-        assertEq(altPayout.balance - altBalanceBefore, 0.18 ether);
+        assertEq(altPayout.balance, altBalanceBefore);
+        assertEq(payouts.balance(altPayout), 0.18 ether);
         assertEq(payouts.balance(PLATFORM), 0.01 ether);
         assertEq(payouts.balance(buyer), 0.01 ether);
 
         _prank(owner);
         collection.setOwnerAltPayout(address(0));
 
-        _prank(altPayout);
-        vm.expectRevert(NotShareholder.selector);
-        collection.withdraw();
+        _mint(collection, other, _auth(ZERO_KEY), 1, 0.1 ether);
+        assertEq(payouts.balance(altPayout), 0.18 ether);
+        assertEq(payouts.balance(owner), 0.09 ether);
+    }
+
+    function test_mint_creditsCurrentOwner() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        ArchetypePayouts payouts = ArchetypePayouts(PAYOUTS);
+        _setPublicInvite(collection, 0.1 ether, uint32(block.timestamp));
+
+        _mintPublic(collection, buyer, address(0), 0.1 ether);
+        _prank(owner);
+        collection.transferOwnership(other);
+        _mintPublic(collection, buyer, address(0), 0.1 ether);
+
+        assertEq(payouts.balance(owner), 0.095 ether);
+        assertEq(payouts.balance(other), 0.095 ether);
+        assertEq(payouts.balance(PLATFORM), 0.01 ether);
+    }
+
+    function test_mint_afterRenouncingOwnership_creditsPlatform() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        ArchetypePayouts payouts = ArchetypePayouts(PAYOUTS);
+        _setPublicInvite(collection, 0.1 ether, uint32(block.timestamp));
+
+        _prank(owner);
+        collection.renounceOwnership();
+        _mintPublic(collection, buyer, address(0), 0.1 ether);
+
+        assertEq(collection.balanceOf(buyer), 1);
+        assertEq(payouts.balance(owner), 0);
+        assertEq(payouts.balance(PLATFORM), 0.1 ether);
     }
 
     function test_mint_failsWhenDefaultPublicInviteIsPaused() public {
@@ -1496,7 +2468,7 @@ contract ArchetypeErc721aTest is Test {
 
         _prank(buyer);
         vm.expectRevert(MintingPaused.selector);
-        collection.mint{value: 0.08 ether}(_auth(ZERO_KEY), 1, address(0), "");
+        collection.mint{value: 0.08 ether}(_auth(ZERO_KEY), 1, address(0), "", _constraints());
     }
 
     function test_mintTo_mintsToAnotherWallet() public {
@@ -1518,14 +2490,14 @@ contract ArchetypeErc721aTest is Test {
         );
 
         _prank(owner);
-        collection.mintTo{value: 0.06 ether}(_auth(ZERO_KEY), 3, buyer, address(0), "");
+        collection.mintTo{value: 0.06 ether}(_auth(ZERO_KEY), 3, buyer, address(0), "", _constraints());
 
         assertEq(collection.balanceOf(buyer), 3);
         assertEq(collection.balanceOf(owner), 0);
 
         _prank(owner);
         vm.expectRevert(IERC721AUpgradeable.MintToZeroAddress.selector);
-        collection.mintTo{value: 0.02 ether}(_auth(ZERO_KEY), 1, address(0), address(0), "");
+        collection.mintTo{value: 0.02 ether}(_auth(ZERO_KEY), 1, address(0), address(0), "", _constraints());
     }
 
     function test_batchMintTo_airdrop() public {
@@ -1568,8 +2540,8 @@ contract ArchetypeErc721aTest is Test {
         }
 
         _prank(owner);
-        collection.batchMintTo(_auth(ownerRoot), firstRecipients, firstQuantities, address(0), "");
-        collection.batchMintTo(_auth(ownerRoot), secondRecipients, secondQuantities, address(0), "");
+        collection.batchMintTo(_auth(ownerRoot), _batchMintArgs(firstRecipients, firstQuantities, _constraints()));
+        collection.batchMintTo(_auth(ownerRoot), _batchMintArgs(secondRecipients, secondQuantities, _constraints()));
 
         assertEq(collection.totalSupply(), 100);
         assertEq(collection.ownerOf(1), recipients[0]);
@@ -1579,15 +2551,25 @@ contract ArchetypeErc721aTest is Test {
         assertEq(collection.ownerOf(100), recipients[99]);
     }
 
-    function test_batch_executeBatch_mintsAndRescues() public {
-        ArchetypeErc721a collection = _createCollectionWithConfig(owner, _configWithSupply(100, 100));
-        ArchetypeBatch batch = ArchetypeBatch(BATCH);
-        address[] memory targets = new address[](5);
-        uint256[] memory values = new uint256[](5);
-        bytes[] memory datas = new bytes[](5);
-        uint256[] memory rescuedIds = new uint256[](1);
+    function test_batchMintTo_rejectsNonOwner() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        address[] memory recipients = new address[](1);
+        recipients[0] = buyer;
+        uint256[] memory quantities = new uint256[](1);
+        quantities[0] = 1;
 
-        _setBatchOwner(owner);
+        _prank(buyer);
+        vm.expectRevert(NotOwner.selector);
+        collection.batchMintTo(_publicAuth(), _batchMintArgs(recipients, quantities, _constraints()));
+    }
+
+    function test_batch_executeBatch_mintsAndConservesNativeValue() public {
+        ArchetypeErc721a collection = _createCollectionWithConfig(owner, _configWithSupply(100, 100));
+        ArchetypeBatchV100 batch = ArchetypeBatchV100(BATCH);
+        address[] memory targets = new address[](3);
+        uint256[] memory values = new uint256[](3);
+        bytes[] memory datas = new bytes[](3);
+
         _setInvite(
             collection,
             ZERO_KEY,
@@ -1621,40 +2603,28 @@ contract ArchetypeErc721aTest is Test {
             targets[i] = address(collection);
         }
 
-        values[3] = 0.2 ether;
-        values[4] = 0.3 ether;
-
-        datas[0] = abi.encodeCall(collection.mintTo, (_auth(ZERO_KEY), 1, BATCH, address(0), ""));
-        datas[1] = abi.encodeCall(collection.mint, (_auth(ZERO_KEY), 2, address(0), ""));
-        datas[2] = abi.encodeCall(collection.mintTo, (_auth(ZERO_KEY), 5, other, address(0), ""));
-        datas[3] = abi.encodeCall(collection.mintTo, (_auth(PUBLIC_KEY), 2, buyer, address(0), ""));
-        datas[4] = abi.encodeCall(collection.mintTo, (_auth(PUBLIC_KEY), 3, other, address(0), ""));
-
-        vm.stopPrank();
-        vm.startPrank(buyer, buyer);
-        batch.executeBatch{value: 0.6 ether}(targets, values, datas);
-        vm.stopPrank();
-
-        assertEq(collection.balanceOf(BATCH), 1);
-        assertEq(collection.balanceOf(buyer), 4);
-        assertEq(collection.balanceOf(other), 8);
-        assertEq(collection.totalSupply(), 13);
-
-        rescuedIds[0] = 1;
-        _prank(owner);
-        batch.rescueERC721(address(collection), rescuedIds, owner);
-        assertEq(collection.ownerOf(1), owner);
+        values[2] = 0.2 ether;
+        datas[0] = abi.encodeCall(collection.mint, (_auth(ZERO_KEY), 1, address(0), "", _constraints()));
+        datas[1] = abi.encodeCall(collection.mint, (_auth(ZERO_KEY), 2, address(0), "", _constraints()));
+        datas[2] = abi.encodeCall(collection.mint, (_auth(PUBLIC_KEY), 2, address(0), "", _constraints()));
 
         vm.txGasPrice(0);
-        uint256 ownerBalanceBefore = owner.balance;
-        _prank(owner);
-        batch.rescueETH(owner);
-        assertEq(owner.balance - ownerBalanceBefore, 0.1 ether);
+        uint256 buyerBalanceBefore = buyer.balance;
+        vm.stopPrank();
+        vm.startPrank(buyer, buyer);
+        batch.executeBatch{value: 0.2 ether}(targets, values, datas);
+        vm.stopPrank();
+
+        assertEq(collection.balanceOf(BATCH), 0);
+        assertEq(collection.balanceOf(buyer), 5);
+        assertEq(collection.totalSupply(), 5);
+        assertEq(buyerBalanceBefore - buyer.balance, 0.2 ether);
+        assertEq(address(batch).balance, 0);
     }
 
-    function test_batch_txOriginBehavior() public {
+    function test_batch_usesDirectCaller() public {
         ArchetypeErc721a collection = _createCollectionWithConfig(owner, _configWithSupply(100, 100));
-        ArchetypeBatch batch = ArchetypeBatch(BATCH);
+        ArchetypeBatchV100 batch = ArchetypeBatchV100(BATCH);
         bytes32 buyerRoot = keccak256(abi.encodePacked(buyer));
         address[] memory targets = new address[](2);
         uint256[] memory values = new uint256[](2);
@@ -1692,56 +2662,17 @@ contract ArchetypeErc721aTest is Test {
         targets[0] = address(collection);
         targets[1] = address(collection);
         values[0] = 0.5 ether;
-        datas[0] = abi.encodeCall(collection.mint, (_auth(ZERO_KEY), 5, address(0), ""));
-        datas[1] = abi.encodeCall(collection.mint, (_auth(buyerRoot), 5, address(0), ""));
+        datas[0] = abi.encodeCall(collection.mint, (_auth(ZERO_KEY), 5, address(0), "", _constraints()));
+        datas[1] = abi.encodeCall(collection.mint, (_auth(buyerRoot), 5, address(0), "", _constraints()));
 
         vm.stopPrank();
-        vm.startPrank(buyer, buyer);
+        vm.startPrank(buyer, owner);
         batch.executeBatch{value: 0.5 ether}(targets, values, datas);
         vm.stopPrank();
 
         assertEq(collection.balanceOf(buyer), 10);
         assertEq(collection.totalSupply(), 10);
-    }
-
-    function test_batch_ownerMethodsWorkThroughBatch() public {
-        ArchetypeErc721a collection = _createCollection(owner);
-        ArchetypeBatch batch = ArchetypeBatch(BATCH);
-        address[] memory targets = new address[](3);
-        uint256[] memory values = new uint256[](3);
-        bytes[] memory datas = new bytes[](3);
-
-        for (uint256 i; i < targets.length; ++i) {
-            targets[i] = address(collection);
-        }
-
-        datas[0] = abi.encodeCall(
-            collection.setInvite,
-            (
-                ZERO_KEY,
-                CID_ZERO,
-                Invite({
-                    price: 0,
-                    start: uint32(block.timestamp),
-                    end: 0,
-                    limit: 100,
-                    maxSupply: 100,
-                    unitSize: 1,
-                    tokenAddress: address(0),
-                    isBlacklist: false
-                })
-            )
-        );
-        datas[1] = abi.encodeCall(collection.setMaxSupply, (1000, "forever"));
-        datas[2] = abi.encodeCall(collection.setBaseURI, ("test"));
-
-        vm.stopPrank();
-        vm.startPrank(owner, owner);
-        batch.executeBatch(targets, values, datas);
-        vm.stopPrank();
-
-        assertEq(_configMaxSupply(collection), 1000);
-        assertEq(_configBaseUri(collection), "test");
+        assertEq(batch.currentCaller(), address(0));
     }
 
     function _createCollection(address receiver) internal returns (ArchetypeErc721a collection) {
@@ -1777,11 +2708,6 @@ contract ArchetypeErc721aTest is Test {
         collection.setInvite(key, CID_ZERO, invite);
     }
 
-    function _setAdvancedInvite(ArchetypeErc721a collection, bytes32 key, AdvancedInvite memory invite) internal {
-        _prank(owner);
-        collection.setAdvancedInvite(key, CID_ZERO, invite);
-    }
-
     function _setBurnInvite(ArchetypeErc721a collection, bytes32 key, BurnInvite memory invite) internal {
         _prank(owner);
         collection.setBurnInvite(key, CID_ZERO, invite);
@@ -1807,14 +2733,14 @@ contract ArchetypeErc721aTest is Test {
 
     function _mintPublic(ArchetypeErc721a collection, address minter, address affiliate, uint256 value) internal {
         _prank(minter);
-        collection.mint{value: value}(_publicAuth(), 1, affiliate, "");
+        collection.mint{value: value}(_publicAuth(), 1, affiliate, "", _constraints());
     }
 
     function _mint(ArchetypeErc721a collection, address minter, Auth memory auth, uint256 quantity, uint256 value)
         internal
     {
         _prank(minter);
-        collection.mint{value: value}(auth, quantity, address(0), "");
+        collection.mint{value: value}(auth, quantity, address(0), "", _constraints());
     }
 
     function _publicAuth() internal pure returns (Auth memory) {
@@ -1838,34 +2764,53 @@ contract ArchetypeErc721aTest is Test {
         }
     }
 
-    function _affiliateSignature(address affiliate) internal view returns (bytes memory) {
-        return _affiliateSignatureWithPk(affiliate, AFFILIATE_SIGNER_PK);
+    function _affiliateSignature(ArchetypeErc721a collection, address affiliate) internal view returns (bytes memory) {
+        return _affiliateSignatureFor(collection, affiliate, buyer, block.timestamp + 1 hours, AFFILIATE_SIGNER_PK);
     }
 
-    function _affiliateSignatureWithPk(address affiliate, uint256 privateKey) internal view returns (bytes memory) {
-        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(keccak256(abi.encodePacked(affiliate)));
+    function _affiliateSignatureFor(
+        ArchetypeErc721a collection,
+        address affiliate,
+        address minter,
+        uint256 deadline,
+        uint256 privateKey
+    ) internal view returns (bytes memory) {
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("Archetype"),
+                keccak256("1"),
+                block.chainid,
+                address(collection)
+            )
+        );
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256("AffiliateAuthorization(address affiliate,address minter,uint256 deadline)"),
+                affiliate,
+                minter,
+                deadline
+            )
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
-        return abi.encodePacked(r, s, v);
-    }
-
-    function _setBatchOwner(address batchOwner) internal {
-        vm.store(BATCH, bytes32(0), bytes32(uint256(uint160(batchOwner))));
+        return abi.encodePacked(bytes32(deadline), r, s, v);
     }
 
     function _configBaseUri(ArchetypeErc721a collection) internal view returns (string memory baseUri) {
-        (baseUri,,,,,,) = collection.config();
+        (baseUri,,,,,) = collection.config();
     }
 
     function _configMaxSupply(ArchetypeErc721a collection) internal view returns (uint32 maxSupply) {
-        (,, maxSupply,,,,) = collection.config();
+        (, maxSupply,,,,) = collection.config();
     }
 
     function _configAffiliateFee(ArchetypeErc721a collection) internal view returns (uint16 affiliateFee) {
-        (,,,, affiliateFee,,) = collection.config();
+        (,,, affiliateFee,,) = collection.config();
     }
 
     function _configAffiliateDiscount(ArchetypeErc721a collection) internal view returns (uint16 affiliateDiscount) {
-        (,,,,, affiliateDiscount,) = collection.config();
+        (,,,, affiliateDiscount,) = collection.config();
     }
 
     function _payoutOwnerAltPayout(ArchetypeErc721a collection) internal view returns (address ownerAltPayout) {
@@ -1875,5 +2820,106 @@ contract ArchetypeErc721aTest is Test {
     function _prank(address actor) internal {
         vm.stopPrank();
         vm.startPrank(actor);
+    }
+
+    function _constraints() internal pure returns (MintConstraints memory) {
+        return _constraints(address(0), type(uint128).max, 0);
+    }
+
+    function _constraints(address currency, uint128 maxCurrencyCost, uint256 minTotalMints)
+        internal
+        pure
+        returns (MintConstraints memory)
+    {
+        return MintConstraints({
+            currency: currency,
+            maxCurrencyCost: maxCurrencyCost,
+            maxNativeValue: type(uint256).max,
+            minTotalMints: minTotalMints
+        });
+    }
+
+    function _burnConstraints(address burnCollection, address burnRecipient, MintConstraints memory constraints)
+        internal
+        pure
+        returns (BurnConstraints memory)
+    {
+        return BurnConstraints({mint: constraints, burnCollection: burnCollection, burnRecipient: burnRecipient});
+    }
+
+    function _batchMintArgs(
+        address[] memory recipients,
+        uint256[] memory quantities,
+        MintConstraints memory constraints
+    ) internal pure returns (Erc721BatchMint memory) {
+        return Erc721BatchMint({
+            recipients: recipients,
+            quantities: quantities,
+            affiliate: address(0),
+            affiliateAuthorization: "",
+            constraints: constraints
+        });
+    }
+}
+
+contract CurrentCallerBatch {
+    address private immutable caller;
+
+    constructor(address caller_) {
+        caller = caller_;
+    }
+
+    function currentCaller() external view returns (address) {
+        return caller;
+    }
+}
+
+contract NonErc721Receiver {}
+
+contract ReentrantBurnSource {
+    address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
+
+    ArchetypeErc721a private destination;
+    address private tokenOwner;
+    bool public mutationBlocked;
+
+    constructor(address tokenOwner_) {
+        tokenOwner = tokenOwner_;
+    }
+
+    function configure(ArchetypeErc721a destination_) external {
+        destination = destination_;
+        destination.setBurnInvite(bytes32(0), bytes32(0), _invite(DEAD));
+    }
+
+    function ownerOf(uint256) external view returns (address) {
+        return tokenOwner;
+    }
+
+    function isApprovedForAll(address, address) external pure returns (bool) {
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256) external {
+        require(from == tokenOwner);
+        tokenOwner = to;
+        try destination.setBurnInvite(bytes32(0), bytes32(0), _invite(address(this))) {}
+        catch {
+            mutationBlocked = true;
+        }
+    }
+
+    function _invite(address burnRecipient) internal view returns (BurnInvite memory) {
+        return BurnInvite({
+            burnErc721: IERC721(address(this)),
+            burnAddress: burnRecipient,
+            tokenAddress: address(0),
+            price: 0,
+            reversed: false,
+            ratio: 1,
+            start: uint32(block.timestamp),
+            end: 0,
+            limit: 1
+        });
     }
 }

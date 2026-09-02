@@ -21,6 +21,18 @@ import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 
 contract ArchetypeBatch is Ownable {
+    uint256 private constant _CURRENT_CALLER_SLOT = 0xa635c9f4c283427ea6864a49a31b6433e5a3c534efd58c9e71bb8c7d5e50ec76;
+
+    constructor(address owner_) {
+        _transferOwnership(owner_);
+    }
+
+    function currentCaller() public view returns (address value) {
+        assembly ("memory-safe") {
+            value := tload(_CURRENT_CALLER_SLOT)
+        }
+    }
+
     // Execute multiple calls in a single transaction
     // targets: The addresses of the contracts
     // values: The value to send to the contracts
@@ -34,6 +46,11 @@ contract ArchetypeBatch is Ownable {
             "ArchetypeBatch: The array lengths must be identical"
         );
 
+        address previousCaller = currentCaller();
+        assembly ("memory-safe") {
+            tstore(_CURRENT_CALLER_SLOT, caller())
+        }
+
         for (uint256 i = 0; i < targets.length; ++i) {
             (bool success, bytes memory returnData) = targets[i].call{value: values[i]}(datas[i]);
 
@@ -41,6 +58,10 @@ contract ArchetypeBatch is Ownable {
                 // Decode the return data as a string and revert with it
                 revert(string(returnData));
             }
+        }
+
+        assembly ("memory-safe") {
+            tstore(_CURRENT_CALLER_SLOT, previousCaller)
         }
     }
 
