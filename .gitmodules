@@ -19,3 +19,6 @@
 [submodule "lib/dn404"]
 	path = lib/dn404
 	url = https://github.com/vectorized/dn404.git
+[submodule "lib/seaport"]
+	path = lib/seaport
+	url = https://github.com/ProjectOpenSea/seaport
