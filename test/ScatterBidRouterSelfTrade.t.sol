@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.36;
 
-import {ScatterBidRouterE2ETest} from "./ScatterBidRouterE2E.t.sol";
+import {ScatterBidRouterE2EBase} from "./ScatterBidRouterE2E.t.sol";
 import {ScatterOfferer} from "../src/ScatterOfferer.sol";
 import {InvalidConsiderationShape} from "../src/ScatterBidRouter.sol";
 import {AdvancedOrder, OrderParameters, ConsiderationItem} from "seaport-types/src/lib/ConsiderationStructs.sol";
 import {ItemType} from "seaport-types/src/lib/ConsiderationEnums.sol";
 import {OrderParametersLib} from "seaport-sol/lib/OrderParametersLib.sol";
 
-contract ScatterBidRouterSelfTradeTest is ScatterBidRouterE2ETest {
+contract ScatterBidRouterSelfTradeTest is ScatterBidRouterE2EBase {
     using OrderParametersLib for OrderParameters;
 
     function test_selfTradeExternalBidsReturnBothNftStandardsAndChargeFees() public {

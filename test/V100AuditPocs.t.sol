@@ -12,7 +12,7 @@ import {FactoryErc721a} from "../src/ERC721a/FactoryErc721a.sol";
 import {MintFeeRegistry} from "../src/MintFeeRegistry.sol";
 import {AffiliateSignerRegistry} from "../src/AffiliateSignerRegistry.sol";
 import {MintConstraints} from "../src/MintConstraints.sol";
-import {RoyaltyPolicyRegistry} from "../src/RoyaltyPolicyRegistry.sol";
+import {ScatterCollectionRegistry} from "../src/ScatterCollectionRegistry.sol";
 import {TestErc20} from "../src/TestErc20.sol";
 
 contract V100AuditPocsTest is Test {
@@ -31,7 +31,7 @@ contract V100AuditPocsTest is Test {
     MintFeeRegistry internal feeRegistry;
     AffiliateSignerRegistry internal affiliateSignerRegistry;
     ArchetypeErc721a internal archetype;
-    RoyaltyPolicyRegistry internal royaltyRegistry;
+    ScatterCollectionRegistry internal rewardsRegistry;
     FactoryErc721a internal factory;
 
     function setUp() public {
@@ -40,21 +40,21 @@ contract V100AuditPocsTest is Test {
         vm.deal(other, 100 ether);
 
         payouts = new ArchetypePayouts();
-        royaltyRegistry = new RoyaltyPolicyRegistry(owner);
-        batch = new ArchetypeBatchV100(owner, royaltyRegistry);
+        rewardsRegistry = new ScatterCollectionRegistry(owner);
+        batch = new ArchetypeBatchV100(owner, rewardsRegistry);
         feeRegistry = new MintFeeRegistry(owner, owner, 0, 1 ether, 0);
         affiliateSignerRegistry = new AffiliateSignerRegistry(owner, vm.addr(AFFILIATE_SIGNER_PK));
         archetype =
             new ArchetypeErc721a(PLATFORM, address(payouts), address(batch), feeRegistry, affiliateSignerRegistry);
 
         vm.startPrank(owner);
-        factory = new FactoryErc721a(address(archetype), owner, royaltyRegistry);
-        royaltyRegistry.setApprovedFactory(address(factory), true);
+        factory = new FactoryErc721a(address(archetype), owner, rewardsRegistry);
+        rewardsRegistry.setApprovedFactory(address(factory), true);
         vm.stopPrank();
     }
 
     function testAudit_executeBatchCannotSpendRetainedAssets() public {
-        ArchetypeBatchV100 target = new ArchetypeBatchV100(owner, royaltyRegistry);
+        ArchetypeBatchV100 target = new ArchetypeBatchV100(owner, rewardsRegistry);
         TestErc20 token = new TestErc20();
         token.mint(10 ether);
 
@@ -252,8 +252,8 @@ contract V100AuditPocsTest is Test {
         archetype =
             new ArchetypeErc721a(PLATFORM, address(payouts), address(batch), feeRegistry, affiliateSignerRegistry);
         vm.startPrank(owner);
-        factory = new FactoryErc721a(address(archetype), owner, royaltyRegistry);
-        royaltyRegistry.setApprovedFactory(address(factory), true);
+        factory = new FactoryErc721a(address(archetype), owner, rewardsRegistry);
+        rewardsRegistry.setApprovedFactory(address(factory), true);
         vm.stopPrank();
 
         ArchetypeErc721a collection = _createCollection(_config());

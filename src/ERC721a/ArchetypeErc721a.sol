@@ -16,6 +16,8 @@
 pragma solidity ^0.8.20;
 
 import "./ArchetypeLogicErc721a.sol";
+import {IMetadataRenderer} from "./IMetadataRenderer.sol";
+import {IMintCallback} from "./IMintCallback.sol";
 import "../IArchetypeBatch.sol";
 import {MintFeeRegistry} from "../MintFeeRegistry.sol";
 import {AffiliateSignerRegistry} from "../AffiliateSignerRegistry.sol";
@@ -50,6 +52,13 @@ contract ArchetypeErc721a is
 
     event Invited(bytes32 indexed key, bytes32 indexed cid);
     event BurnInvited(bytes32 indexed key, bytes32 indexed cid);
+    event MetadataUpdate(uint256 _tokenId);
+    event BatchMetadataUpdate(uint256 _fromTokenId, uint256 _toTokenId);
+    event MintPricingUpdated(bytes32 indexed key, address calculator);
+
+    error InvalidMetadataRenderer();
+    error InvalidMetadataRange();
+    error InvalidMintCallback();
     event Referral(address indexed affiliate, address token, uint128 wad, uint256 numMints, uint256 paymentValue);
 
     address private immutable _platform;
@@ -67,6 +76,9 @@ contract ArchetypeErc721a is
     Config public config;
     PayoutConfig public payoutConfig;
     Options public options;
+    address public metadataRenderer;
+    address public mintCallback;
+    mapping(bytes32 => MintPricing) public mintPricing;
 
     constructor(
         address platform,
@@ -235,6 +247,7 @@ contract ArchetypeErc721a is
             invite,
             config,
             payoutConfig,
+            mintPricing[auth.key],
             auth.key,
             quantity,
             args.affiliate != address(0),
@@ -257,6 +270,7 @@ contract ArchetypeErc721a is
             payment.nativeValue
         );
 
+        mintPricing[auth.key].sold += quantity;
         if (invite.limit < invite.maxSupply) {
             _minted[args.sender][auth.key] += totalQuantity;
         }
@@ -348,6 +362,8 @@ contract ArchetypeErc721a is
     {
         if (!_exists(tokenId)) revert URIQueryForNonexistentToken();
 
+        if (metadataRenderer != address(0)) return IMetadataRenderer(metadataRenderer).tokenURI(tokenId);
+
         return
             bytes(config.baseUri).length != 0
                 ? string(abi.encodePacked(config.baseUri, LibString.toString(tokenId)))
@@ -368,7 +384,10 @@ contract ArchetypeErc721a is
 
     function computePrice(bytes32 key, uint256 quantity, bool affiliateUsed) external view returns (uint256) {
         Invite storage i = invites[key];
-        return ArchetypeLogicErc721a.computePrice(i, config.affiliateDiscount, quantity, affiliateUsed);
+        return
+            ArchetypeLogicErc721a.computePrice(
+                i, mintPricing[key], key, config.affiliateDiscount, quantity, affiliateUsed
+            );
     }
 
     function computeMintPayment(bytes32 key, uint256 quantity, bool affiliateUsed)
@@ -382,6 +401,7 @@ contract ArchetypeErc721a is
             invite,
             config,
             payoutConfig,
+            mintPricing[key],
             key,
             paidQuantity,
             affiliateUsed,
@@ -391,12 +411,61 @@ contract ArchetypeErc721a is
         return (payment.currencyCost, payment.nativeValue, invite.tokenAddress, paidQuantity + bonusMints);
     }
 
+    function setMintPricing(bytes32 key, address calculator) external nonReentrant _onlyOwner {
+        ArchetypeLogicErc721a.setMintPricing(invites[key], mintPricing[key], key, calculator);
+        emit MintPricingUpdated(key, calculator);
+    }
+
     function setBaseURI(string memory baseUri) external _onlyOwner {
         if (options.uriLocked) {
             revert LockedForever();
         }
 
         config.baseUri = baseUri;
+        _refreshAllMetadata();
+    }
+
+    function setMetadataRenderer(address renderer) external _onlyOwner {
+        if (options.uriLocked) revert LockedForever();
+        if (renderer != address(0) && (renderer == address(this) || renderer.code.length == 0)) {
+            revert InvalidMetadataRenderer();
+        }
+        metadataRenderer = renderer;
+        _refreshAllMetadata();
+    }
+
+    function setMintCallback(address callback) external nonReentrant _onlyOwner {
+        if (options.uriLocked) revert LockedForever();
+        if (callback != address(0) && (callback == address(this) || callback.code.length == 0)) {
+            revert InvalidMintCallback();
+        }
+        mintCallback = callback;
+    }
+
+    function _afterTokenTransfers(address from, address to, uint256 startTokenId, uint256 quantity) internal override {
+        super._afterTokenTransfers(from, to, startTokenId, quantity);
+        if (from != address(0)) return;
+        address callback = mintCallback;
+        if (callback == address(0)) return;
+        uint256 end = startTokenId + quantity;
+        for (uint256 tokenId = startTokenId; tokenId < end; ++tokenId) {
+            IMintCallback(callback).tokenMinted(tokenId);
+        }
+    }
+
+    function refreshMetadata(uint256 fromId, uint256 toId) external {
+        if (msg.sender != metadataRenderer && msg.sender != mintCallback && _msgSender() != owner()) revert NotOwner();
+        if (fromId < _startTokenId() || fromId > toId || toId >= _nextTokenId()) {
+            revert InvalidMetadataRange();
+        }
+        emit BatchMetadataUpdate(fromId, toId);
+    }
+
+    function _refreshAllMetadata() internal {
+        uint256 mintedCount = _totalMinted();
+        if (mintedCount == 0) return;
+        uint256 startId = _startTokenId();
+        emit BatchMetadataUpdate(startId, startId + mintedCount - 1);
     }
 
     /// @notice the password is "forever"
@@ -573,7 +642,8 @@ contract ArchetypeErc721a is
         // - IERC721: 0x80ac58cd
         // - IERC721Metadata: 0x5b5e139f
         // - IERC2981: 0x2a55205a
-        return ERC721AUpgradeable.supportsInterface(interfaceId) || ERC2981Upgradeable.supportsInterface(interfaceId);
+        return interfaceId == 0x49064906 || ERC721AUpgradeable.supportsInterface(interfaceId)
+            || ERC2981Upgradeable.supportsInterface(interfaceId);
     }
 
     function setDefaultRoyalty(address receiver, uint16 feeNumerator) public _onlyOwner {

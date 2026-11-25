@@ -30,7 +30,7 @@ import {
 } from "seaport-types/src/lib/ConsiderationStructs.sol";
 import {ItemType, OrderType} from "seaport-types/src/lib/ConsiderationEnums.sol";
 
-contract ScatterBidRouterE2ETest is ConduitTest {
+abstract contract ScatterBidRouterE2EBase is ConduitTest {
     uint256 internal constant BIDDER_PK = 0xB1D;
     uint256 internal constant AUTHORIZER_PK = 0xA11CE;
     address internal bidder = vm.addr(BIDDER_PK);
@@ -78,6 +78,202 @@ contract ScatterBidRouterE2ETest is ConduitTest {
         vm.stopPrank();
     }
 
+    function nativeOrder(
+        bool erc1155,
+        uint256 tokenId,
+        uint256 quantity,
+        address token,
+        uint256 price,
+        address referrer
+    ) external view returns (AdvancedOrder memory order) {
+        ScatterOfferer.ScatterListing[] memory listings = new ScatterOfferer.ScatterListing[](1);
+        listings[0] = ScatterOfferer.ScatterListing({
+            assetType: erc1155 ? ScatterOfferer.AssetType.ERC1155 : ScatterOfferer.AssetType.ERC721,
+            collection: erc1155 ? address(nft1155) : address(nft721),
+            tokenId: tokenId,
+            quantity: erc1155 ? 20 : 1,
+            currency: token,
+            priceWei: price
+        });
+        ScatterOfferer.ScatterSubmission memory submission = ScatterOfferer.ScatterSubmission({
+            role: ScatterOfferer.Role.Bid,
+            listings: listings,
+            criteriaRoot: bytes32(0),
+            maxFeeBps: 500,
+            startTime: block.timestamp,
+            endTime: block.timestamp + 1 hours,
+            nonce: 0,
+            salt: bytes32(tokenId)
+        });
+        ScatterOfferer.ScatterFill[] memory fills = new ScatterOfferer.ScatterFill[](1);
+        fills[0] = ScatterOfferer.ScatterFill(0, tokenId, quantity);
+        bytes32 submissionHash = offerer.hashSubmission(submission);
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory feeSignature;
+        if (referrer != address(0)) {
+            feeSignature = _sign(
+                AUTHORIZER_PK,
+                _digest(
+                    address(offerer),
+                    "Scatter Marketplace",
+                    keccak256(
+                        abi.encode(
+                            offerer.FEE_AUTHORIZATION_TYPEHASH(),
+                            seller,
+                            referrer,
+                            submissionHash,
+                            keccak256(abi.encode(fills)),
+                            deadline
+                        )
+                    )
+                )
+            );
+        }
+        order.extraData = abi.encode(
+            submission, _sign(BIDDER_PK, submissionHash), referrer, fills, new bytes32[][](0), deadline, feeSignature
+        );
+        (SpentItem[] memory offers, ReceivedItem[] memory considerations) =
+            offerer.previewOrder(address(seaport), seller, new SpentItem[](0), new SpentItem[](0), order.extraData);
+        order.parameters.offerer = address(offerer);
+        order.parameters.orderType = OrderType.CONTRACT;
+        order.parameters.startTime = block.timestamp;
+        order.parameters.endTime = block.timestamp + 1 hours;
+        order.parameters.offer = new OfferItem[](1);
+        order.parameters.offer[0] =
+            OfferItem(offers[0].itemType, offers[0].token, offers[0].identifier, offers[0].amount, offers[0].amount);
+        order.parameters.consideration = new ConsiderationItem[](1);
+        ReceivedItem memory item = considerations[0];
+        order.parameters.consideration[0] =
+            ConsiderationItem(item.itemType, item.token, item.identifier, item.amount, item.amount, item.recipient);
+        order.parameters.totalOriginalConsiderationItems = 1;
+        order.numerator = 1;
+        order.denominator = 1;
+    }
+
+    function _externalOrder(
+        bool erc1155,
+        uint256 tokenId,
+        uint256 quantity,
+        address token,
+        uint256 amount,
+        uint120 numerator,
+        uint120 denominator
+    ) internal view returns (AdvancedOrder memory order) {
+        order.parameters.offerer = bidder;
+        order.parameters.orderType = denominator == 1 ? OrderType.FULL_OPEN : OrderType.PARTIAL_OPEN;
+        order.parameters.startTime = block.timestamp;
+        order.parameters.endTime = block.timestamp + 1 hours;
+        order.parameters.salt = tokenId;
+        order.parameters.conduitKey = conduitKey;
+        order.parameters.offer = new OfferItem[](1);
+        order.parameters.offer[0] = OfferItem(ItemType.ERC20, token, 0, amount, amount);
+        order.parameters.consideration = new ConsiderationItem[](1);
+        order.parameters.consideration[0] = ConsiderationItem(
+            erc1155 ? ItemType.ERC1155 : ItemType.ERC721,
+            erc1155 ? address(nft1155) : address(nft721),
+            tokenId,
+            quantity,
+            quantity,
+            payable(bidder)
+        );
+        order.parameters.totalOriginalConsiderationItems = 1;
+        order.numerator = numerator;
+        order.denominator = denominator;
+        _signExternalOrder(order);
+    }
+
+    function _externalComponents(AdvancedOrder memory order) internal view returns (OrderComponents memory) {
+        return OrderComponents({
+            offerer: bidder,
+            zone: address(0),
+            offer: order.parameters.offer,
+            consideration: order.parameters.consideration,
+            orderType: order.parameters.orderType,
+            startTime: order.parameters.startTime,
+            endTime: order.parameters.endTime,
+            zoneHash: bytes32(0),
+            salt: order.parameters.salt,
+            conduitKey: conduitKey,
+            counter: 0
+        });
+    }
+
+    function _signExternalOrder(AdvancedOrder memory order) internal view {
+        (, bytes32 domainSeparator,) = seaport.information();
+        order.signature = _sign(
+            BIDDER_PK,
+            keccak256(abi.encodePacked("\x19\x01", domainSeparator, seaport.getOrderHash(_externalComponents(order))))
+        );
+    }
+
+    function _sell(AdvancedOrder[] memory orders, ScatterBidRouter.MinimumPayout[] memory minima, address referrer)
+        internal
+    {
+        CriteriaResolver[][] memory resolvers = _resolvers(orders.length);
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory signature;
+        if (referrer != address(0)) {
+            signature = _sign(
+                AUTHORIZER_PK,
+                _digest(
+                    address(router),
+                    "ScatterBidRouter",
+                    keccak256(
+                        abi.encode(
+                            router.FEE_AUTHORIZATION_TYPEHASH(),
+                            seller,
+                            referrer,
+                            keccak256(abi.encode(orders, resolvers)),
+                            deadline
+                        )
+                    )
+                )
+            );
+        }
+        vm.prank(seller);
+        router.sellIntoBids(orders, resolvers, referrer, minima, deadline, signature);
+    }
+
+    function _resolvers(uint256 count) internal pure returns (CriteriaResolver[][] memory resolvers) {
+        resolvers = new CriteriaResolver[][](count);
+        for (uint256 i; i < count; ++i) {
+            resolvers[i] = new CriteriaResolver[](0);
+        }
+    }
+
+    function _minimum(address token, uint256 amount)
+        internal
+        pure
+        returns (ScatterBidRouter.MinimumPayout[] memory minima)
+    {
+        minima = new ScatterBidRouter.MinimumPayout[](1);
+        minima[0] = ScatterBidRouter.MinimumPayout(token, amount);
+    }
+
+    function _digest(address verifyingContract, string memory name, bytes32 structHash)
+        internal
+        view
+        returns (bytes32)
+    {
+        bytes32 domain = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes(name)),
+                keccak256("1"),
+                block.chainid,
+                verifyingContract
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", domain, structHash));
+    }
+
+    function _sign(uint256 key, bytes32 digest) internal pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, digest);
+        return abi.encodePacked(r, s, v);
+    }
+}
+
+contract ScatterBidRouterE2ETest is ScatterBidRouterE2EBase {
     function test_mixedSourcesStandardsAndCurrenciesPayPerFillWithoutDoubleFees() public {
         AdvancedOrder[] memory orders = new AdvancedOrder[](2);
         orders[0] = this.nativeOrder(false, 1, 1, address(currency), 1 ether, address(0));
@@ -254,6 +450,26 @@ contract ScatterBidRouterE2ETest is ConduitTest {
         assertEq(currency.balanceOf(seller), 1.9 ether);
         assertEq(currency.balanceOf(rewards), 0.05 ether);
         assertEq(currency.balanceOf(router.PLATFORM()), 0.05 ether);
+    }
+
+    function test_nativeBalanceHeldBySeaportDoesNotBlockSale() public {
+        vm.deal(address(seaport), 1 wei);
+        AdvancedOrder[] memory orders = new AdvancedOrder[](1);
+        orders[0] = _externalOrder(false, 1, 1, address(currency), 2 ether, 1, 1);
+
+        _sell(orders, _minimum(address(currency), 1.9 ether), address(0));
+        assertEq(nft721.ownerOf(1), bidder);
+        assertEq(currency.balanceOf(seller), 1.9 ether);
+        assertEq(address(seaport).balance, 0);
+        assertEq(address(router).balance, 1 wei);
+    }
+
+    function test_rejectsNativeTokensFromOtherSenders() public {
+        vm.deal(seller, 1 wei);
+        vm.prank(seller);
+        (bool accepted,) = address(router).call{value: 1 wei}("");
+        assertFalse(accepted);
+        assertEq(address(router).balance, 0);
     }
 
     function testFuzz_externalRejectsZeroAndRouterRecipients(bool erc1155, bool routerRecipient) public {
@@ -478,200 +694,6 @@ contract ScatterBidRouterE2ETest is ConduitTest {
         assertEq(nft721.ownerOf(1), seller);
         assertEq(currency.balanceOf(bidder), 100 ether);
         assertEq(currency.balanceOf(seller), 0);
-    }
-
-    function nativeOrder(
-        bool erc1155,
-        uint256 tokenId,
-        uint256 quantity,
-        address token,
-        uint256 price,
-        address referrer
-    ) external view returns (AdvancedOrder memory order) {
-        ScatterOfferer.ScatterListing[] memory listings = new ScatterOfferer.ScatterListing[](1);
-        listings[0] = ScatterOfferer.ScatterListing({
-            assetType: erc1155 ? ScatterOfferer.AssetType.ERC1155 : ScatterOfferer.AssetType.ERC721,
-            collection: erc1155 ? address(nft1155) : address(nft721),
-            tokenId: tokenId,
-            quantity: erc1155 ? 20 : 1,
-            currency: token,
-            priceWei: price
-        });
-        ScatterOfferer.ScatterSubmission memory submission = ScatterOfferer.ScatterSubmission({
-            role: ScatterOfferer.Role.Bid,
-            listings: listings,
-            criteriaRoot: bytes32(0),
-            maxFeeBps: 500,
-            startTime: block.timestamp,
-            endTime: block.timestamp + 1 hours,
-            nonce: 0,
-            salt: bytes32(tokenId)
-        });
-        ScatterOfferer.ScatterFill[] memory fills = new ScatterOfferer.ScatterFill[](1);
-        fills[0] = ScatterOfferer.ScatterFill(0, tokenId, quantity);
-        bytes32 submissionHash = offerer.hashSubmission(submission);
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes memory feeSignature;
-        if (referrer != address(0)) {
-            feeSignature = _sign(
-                AUTHORIZER_PK,
-                _digest(
-                    address(offerer),
-                    "Scatter Marketplace",
-                    keccak256(
-                        abi.encode(
-                            offerer.FEE_AUTHORIZATION_TYPEHASH(),
-                            seller,
-                            referrer,
-                            submissionHash,
-                            keccak256(abi.encode(fills)),
-                            deadline
-                        )
-                    )
-                )
-            );
-        }
-        order.extraData = abi.encode(
-            submission, _sign(BIDDER_PK, submissionHash), referrer, fills, new bytes32[][](0), deadline, feeSignature
-        );
-        (SpentItem[] memory offers, ReceivedItem[] memory considerations) =
-            offerer.previewOrder(address(seaport), seller, new SpentItem[](0), new SpentItem[](0), order.extraData);
-        order.parameters.offerer = address(offerer);
-        order.parameters.orderType = OrderType.CONTRACT;
-        order.parameters.startTime = block.timestamp;
-        order.parameters.endTime = block.timestamp + 1 hours;
-        order.parameters.offer = new OfferItem[](1);
-        order.parameters.offer[0] =
-            OfferItem(offers[0].itemType, offers[0].token, offers[0].identifier, offers[0].amount, offers[0].amount);
-        order.parameters.consideration = new ConsiderationItem[](1);
-        ReceivedItem memory item = considerations[0];
-        order.parameters.consideration[0] =
-            ConsiderationItem(item.itemType, item.token, item.identifier, item.amount, item.amount, item.recipient);
-        order.parameters.totalOriginalConsiderationItems = 1;
-        order.numerator = 1;
-        order.denominator = 1;
-    }
-
-    function _externalOrder(
-        bool erc1155,
-        uint256 tokenId,
-        uint256 quantity,
-        address token,
-        uint256 amount,
-        uint120 numerator,
-        uint120 denominator
-    ) internal view returns (AdvancedOrder memory order) {
-        order.parameters.offerer = bidder;
-        order.parameters.orderType = denominator == 1 ? OrderType.FULL_OPEN : OrderType.PARTIAL_OPEN;
-        order.parameters.startTime = block.timestamp;
-        order.parameters.endTime = block.timestamp + 1 hours;
-        order.parameters.salt = tokenId;
-        order.parameters.conduitKey = conduitKey;
-        order.parameters.offer = new OfferItem[](1);
-        order.parameters.offer[0] = OfferItem(ItemType.ERC20, token, 0, amount, amount);
-        order.parameters.consideration = new ConsiderationItem[](1);
-        order.parameters.consideration[0] = ConsiderationItem(
-            erc1155 ? ItemType.ERC1155 : ItemType.ERC721,
-            erc1155 ? address(nft1155) : address(nft721),
-            tokenId,
-            quantity,
-            quantity,
-            payable(bidder)
-        );
-        order.parameters.totalOriginalConsiderationItems = 1;
-        order.numerator = numerator;
-        order.denominator = denominator;
-        _signExternalOrder(order);
-    }
-
-    function _externalComponents(AdvancedOrder memory order) internal view returns (OrderComponents memory) {
-        return OrderComponents({
-            offerer: bidder,
-            zone: address(0),
-            offer: order.parameters.offer,
-            consideration: order.parameters.consideration,
-            orderType: order.parameters.orderType,
-            startTime: order.parameters.startTime,
-            endTime: order.parameters.endTime,
-            zoneHash: bytes32(0),
-            salt: order.parameters.salt,
-            conduitKey: conduitKey,
-            counter: 0
-        });
-    }
-
-    function _signExternalOrder(AdvancedOrder memory order) internal view {
-        (, bytes32 domainSeparator,) = seaport.information();
-        order.signature = _sign(
-            BIDDER_PK,
-            keccak256(abi.encodePacked("\x19\x01", domainSeparator, seaport.getOrderHash(_externalComponents(order))))
-        );
-    }
-
-    function _sell(AdvancedOrder[] memory orders, ScatterBidRouter.MinimumPayout[] memory minima, address referrer)
-        internal
-    {
-        CriteriaResolver[][] memory resolvers = _resolvers(orders.length);
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes memory signature;
-        if (referrer != address(0)) {
-            signature = _sign(
-                AUTHORIZER_PK,
-                _digest(
-                    address(router),
-                    "ScatterBidRouter",
-                    keccak256(
-                        abi.encode(
-                            router.FEE_AUTHORIZATION_TYPEHASH(),
-                            seller,
-                            referrer,
-                            keccak256(abi.encode(orders, resolvers)),
-                            deadline
-                        )
-                    )
-                )
-            );
-        }
-        vm.prank(seller);
-        router.sellIntoBids(orders, resolvers, referrer, minima, deadline, signature);
-    }
-
-    function _resolvers(uint256 count) internal pure returns (CriteriaResolver[][] memory resolvers) {
-        resolvers = new CriteriaResolver[][](count);
-        for (uint256 i; i < count; ++i) {
-            resolvers[i] = new CriteriaResolver[](0);
-        }
-    }
-
-    function _minimum(address token, uint256 amount)
-        internal
-        pure
-        returns (ScatterBidRouter.MinimumPayout[] memory minima)
-    {
-        minima = new ScatterBidRouter.MinimumPayout[](1);
-        minima[0] = ScatterBidRouter.MinimumPayout(token, amount);
-    }
-
-    function _digest(address verifyingContract, string memory name, bytes32 structHash)
-        internal
-        view
-        returns (bytes32)
-    {
-        bytes32 domain = keccak256(
-            abi.encode(
-                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-                keccak256(bytes(name)),
-                keccak256("1"),
-                block.chainid,
-                verifyingContract
-            )
-        );
-        return keccak256(abi.encodePacked("\x19\x01", domain, structHash));
-    }
-
-    function _sign(uint256 key, bytes32 digest) internal pure returns (bytes memory) {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, digest);
-        return abi.encodePacked(r, s, v);
     }
 }
 

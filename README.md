@@ -4,7 +4,7 @@ Solidity contracts for Scatter's NFT launchpad and marketplace.
 
 ## Source and verification
 
-The marketplace contracts and their dependencies mirror Scatter monorepo commit `32368270e4e4d6bcba65547290d36296ce083f46` on `master`. Existing launchpad contracts retain their previously published versions. This is not a statement that every contract is deployed on every chain.
+The published launchpad and marketplace contracts mirror Scatter monorepo commit `271351d7685816838cfa5a5faf93a863ec5638b2` on `master`. Legacy `BURGERS404` contracts retain their previously published v0.8.0 versions. This is not a statement that every contract is deployed on every chain.
 
 Use Foundry 1.8.0 to run the self-contained contract tests:
 

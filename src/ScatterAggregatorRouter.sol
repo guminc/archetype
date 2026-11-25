@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-// ScatterAggregatorRouter v0.3.0
+// ScatterAggregatorRouter v0.4.0
 //
 //        d8888                 888               888
 //       d88888                 888               888
@@ -22,7 +22,7 @@ import {ConduitItemType} from "seaport-types/src/conduit/lib/ConduitEnums.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
@@ -38,6 +38,7 @@ import {
 import {ItemType, OrderType} from "seaport-types/src/lib/ConsiderationEnums.sol";
 import {SeaportInterface} from "seaport-types/src/interfaces/SeaportInterface.sol";
 import {ScatterCollectionRegistry} from "./ScatterCollectionRegistry.sol";
+import {ScatterExchange} from "./ScatterExchange.sol";
 
 error InsufficientPayment();
 error InvalidListingAmount();
@@ -62,6 +63,9 @@ error OrderHashMismatch();
 error InvalidScatterCollectionRegistry();
 error InvalidFeeAuthorizer();
 error InvalidScatterOfferer();
+error InvalidScatterExchange();
+error InvalidExchangeCalldata();
+error EmptyExchangeSweep();
 error InvalidFeeAuthorization();
 error FeeAuthorizationExpired();
 error InvalidFeeBps();
@@ -70,13 +74,14 @@ error FeeBpsExceedsLimit(uint256 currentFeeBps, uint256 maximumFeeBps);
 
 error OrderNotFilled(bytes32 orderHash);
 
-contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP712, ConduitConsumer {
+contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuardTransient, EIP712, ConduitConsumer {
     using SafeERC20 for IERC20;
 
     address public immutable SEAPORT =
         block.chainid == 4326 ? 0x00000000006687982678b03100B9bDC8be440814 : 0x0000000000000068F116a894984e2DB1123eB395;
     bytes4 private constant FULFILL_ADVANCED_ORDER_SELECTOR = 0xe7acab24;
     bytes4 private constant FULFILL_AVAILABLE_ADVANCED_ORDERS_SELECTOR = 0x87201b41;
+    bytes4 private constant EXCHANGE_BUY_LISTINGS_SELECTOR = ScatterExchange.buyListings.selector;
     address public constant PLATFORM = 0x8952caF7E5bf1fe63ebe94148ca802F3eF127C98;
 
     uint256 public constant DEFAULT_FEE_BPS = 500;
@@ -85,23 +90,53 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
     uint256 public constant BPS_DENOMINATOR = 10000;
     uint256 public constant MAX_AUTHORIZATION_WINDOW = 7 days;
 
-    /// The external caller whose Seaport fulfillment is in progress, or zero between calls.
-    /// ScatterOfferer uses this value for sale attribution because Seaport sees the router
-    /// as the fulfiller and a direct caller can forge an address in extraData.
-    address private _activeRoutedFulfiller;
+    /// The external caller whose routed fulfillment is in progress, or zero between calls.
+    /// ScatterOfferer and ScatterExchange use this value for sale attribution and affiliate
+    /// authorization because they see the router as caller and a direct caller can forge data.
+    address public transient activeRoutedFulfiller;
     ScatterCollectionRegistry public immutable scatterCollectionRegistry;
     address public immutable SCATTER_OFFERER;
+    address public immutable SCATTER_EXCHANGE;
 
     /// Server-held signer for affiliate fee authorizations. The owner may rotate it.
     address public feeAuthorizer;
-    uint256 public feeBps = DEFAULT_FEE_BPS;
-    uint256 public feeSplitBps = DEFAULT_FEE_SPLIT_BPS;
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint16 private _feeBps = uint16(DEFAULT_FEE_BPS);
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint16 private _feeSplitBps = uint16(DEFAULT_FEE_SPLIT_BPS);
 
     bytes32 public constant FEE_AUTHORIZATION_TYPEHASH =
         keccak256("FeeAuthorization(address buyer,address affiliate,bytes32 ordersHash,uint256 deadline)");
 
-    function activeRoutedFulfiller() external view returns (address) {
-        return _activeRoutedFulfiller;
+    function feeBps() external view returns (uint256) {
+        return _feeBps;
+    }
+
+    function feeSplitBps() external view returns (uint256) {
+        return _feeSplitBps;
+    }
+
+    struct SeaportMixedSweep {
+        bytes fulfillAvailableCalldata;
+        uint256 totalNativeValue;
+        uint256[] feeChargedOrderIndexes;
+        address[] erc20s;
+        uint256[] erc20Amounts;
+        address affiliate;
+        uint256 feeAuthorizationDeadline;
+        bytes feeAuthorizationSignature;
+        uint256 maximumFeeBps;
+    }
+
+    struct SeaportErc20Sweep {
+        bytes fulfillAvailableCalldata;
+        address erc20;
+        uint256 totalErc20Amount;
+        uint256[] feeChargedOrderIndexes;
+        address affiliate;
+        uint256 feeAuthorizationDeadline;
+        bytes feeAuthorizationSignature;
+        uint256 maximumFeeBps;
     }
 
     struct Fees {
@@ -151,6 +186,7 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         ScatterCollectionRegistry scatterCollectionRegistry_,
         address initialFeeAuthorizer,
         address scatterOfferer,
+        address scatterExchange,
         bytes32 conduitKey
     ) Ownable(initialOwner) EIP712("ScatterAggregatorRouter", "1") ConduitConsumer(conduitKey) {
         if (address(scatterCollectionRegistry_).code.length == 0) {
@@ -158,9 +194,11 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         }
         if (initialFeeAuthorizer == address(0)) revert InvalidFeeAuthorizer();
         if (scatterOfferer.code.length == 0) revert InvalidScatterOfferer();
+        if (scatterExchange.code.length == 0) revert InvalidScatterExchange();
         scatterCollectionRegistry = scatterCollectionRegistry_;
         feeAuthorizer = initialFeeAuthorizer;
         SCATTER_OFFERER = scatterOfferer;
+        SCATTER_EXCHANGE = scatterExchange;
     }
 
     function buyExternalListing(
@@ -173,7 +211,7 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         uint256 maximumFeeBps
     ) external payable nonReentrant whenNotPaused {
         uint256 appliedFeeBps = _validatedFeeBps(maximumFeeBps);
-        uint256 appliedFeeSplitBps = feeSplitBps;
+        uint256 appliedFeeSplitBps = _feeSplitBps;
         AdvancedOrder memory order = _decodeSingleOrder(seaportFulfillCalldata);
         ConsiderationItem[] memory originalConsideration = _originalConsideration(order);
         if (_orderHash(order, originalConsideration) != orderHash) revert OrderHashMismatch();
@@ -181,10 +219,8 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         _validateFeeAuthorization(
             affiliate, keccak256(abi.encode(orderHash)), feeAuthorizationDeadline, feeAuthorizationSignature
         );
-        address rewardsRecipient = scatterCollectionRegistry.rewardsRecipient(_listingCollection(order));
-        uint256 maximumScatterFee =
-            _computeListingFee(maximumSeaportAmount, appliedFeeBps, appliedFeeSplitBps, affiliate, rewardsRecipient)
-        .totalAmount;
+        address rewardsRecipient = _rewardsRecipient(order, affiliate);
+        uint256 maximumScatterFee = Math.mulDiv(maximumSeaportAmount, appliedFeeBps, BPS_DENOMINATOR);
 
         if (maximumSeaportAmount == 0) revert InvalidListingAmount();
         if (msg.value < maximumSeaportAmount + maximumScatterFee) revert InsufficientPayment();
@@ -226,7 +262,7 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         uint256 maximumFeeBps
     ) external nonReentrant whenNotPaused {
         uint256 appliedFeeBps = _validatedFeeBps(maximumFeeBps);
-        uint256 appliedFeeSplitBps = feeSplitBps;
+        uint256 appliedFeeSplitBps = _feeSplitBps;
         AdvancedOrder memory order = _decodeSingleOrder(seaportFulfillCalldata);
         ConsiderationItem[] memory originalConsideration = _originalConsideration(order);
         if (_orderHash(order, originalConsideration) != orderHash) revert OrderHashMismatch();
@@ -236,11 +272,9 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         _validateFeeAuthorization(
             affiliate, keccak256(abi.encode(orderHash)), feeAuthorizationDeadline, feeAuthorizationSignature
         );
-        address rewardsRecipient = scatterCollectionRegistry.rewardsRecipient(_listingCollection(order));
+        address rewardsRecipient = _rewardsRecipient(order, affiliate);
         IERC20 token = IERC20(erc20);
-        uint256 maximumScatterFee =
-            _computeListingFee(maximumSeaportAmount, appliedFeeBps, appliedFeeSplitBps, affiliate, rewardsRecipient)
-        .totalAmount;
+        uint256 maximumScatterFee = Math.mulDiv(maximumSeaportAmount, appliedFeeBps, BPS_DENOMINATOR);
 
         if (maximumSeaportAmount == 0) revert InvalidListingAmount();
 
@@ -287,7 +321,64 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         uint256 maximumFeeBps
     ) external payable nonReentrant whenNotPaused {
         uint256 appliedFeeBps = _validatedFeeBps(maximumFeeBps);
-        uint256 appliedFeeSplitBps = feeSplitBps;
+        uint256 appliedFeeSplitBps = _feeSplitBps;
+        uint256 balanceNativeBefore = address(this).balance - msg.value;
+        _sweepMixedSeaport(
+            seaportFulfillAvailableCalldata,
+            seaportTotalNativeValue,
+            feeChargedOrderIndexes,
+            erc20s,
+            erc20Amounts,
+            affiliate,
+            feeAuthorizationDeadline,
+            feeAuthorizationSignature,
+            appliedFeeBps,
+            appliedFeeSplitBps,
+            balanceNativeBefore
+        );
+    }
+
+    function sweepMixedWithExchange(
+        SeaportMixedSweep calldata seaportSweep,
+        bytes calldata exchangeBuyCalldata,
+        uint256 exchangeNativeValue
+    ) external payable nonReentrant whenNotPaused {
+        uint256 appliedFeeBps = _validatedFeeBps(seaportSweep.maximumFeeBps);
+        uint256 appliedFeeSplitBps = _feeSplitBps;
+        _validateExchangeBuyCalldata(exchangeBuyCalldata);
+        if (msg.value < exchangeNativeValue + seaportSweep.totalNativeValue) {
+            revert InsufficientPayment();
+        }
+        uint256 balanceNativeBefore = address(this).balance - msg.value;
+        _executeExchangeBuy(exchangeBuyCalldata, exchangeNativeValue);
+        _sweepMixedSeaport(
+            seaportSweep.fulfillAvailableCalldata,
+            seaportSweep.totalNativeValue,
+            seaportSweep.feeChargedOrderIndexes,
+            seaportSweep.erc20s,
+            seaportSweep.erc20Amounts,
+            seaportSweep.affiliate,
+            seaportSweep.feeAuthorizationDeadline,
+            seaportSweep.feeAuthorizationSignature,
+            appliedFeeBps,
+            appliedFeeSplitBps,
+            balanceNativeBefore
+        );
+    }
+
+    function _sweepMixedSeaport(
+        bytes calldata seaportFulfillAvailableCalldata,
+        uint256 seaportTotalNativeValue,
+        uint256[] calldata feeChargedOrderIndexes,
+        address[] calldata erc20s,
+        uint256[] calldata erc20Amounts,
+        address affiliate,
+        uint256 feeAuthorizationDeadline,
+        bytes calldata feeAuthorizationSignature,
+        uint256 appliedFeeBps,
+        uint256 appliedFeeSplitBps,
+        uint256 balanceNativeBefore
+    ) internal {
         if (erc20s.length != erc20Amounts.length) revert LengthMismatch();
         if (
             seaportFulfillAvailableCalldata.length < 4
@@ -302,7 +393,6 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
             }
         }
 
-        uint256 balanceNativeBefore = address(this).balance - msg.value;
         uint256[] memory balancesErc20Before = new uint256[](erc20s.length);
 
         for (uint256 i = 0; i < erc20s.length; i++) {
@@ -395,8 +485,7 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
 
             uint256 feeBaseAmount =
                 _deriveNativeFeeBase(originalConsiderations[orderIndex], fillNumerators[i], fillDenominators[i]);
-            address rewardsRecipient =
-                scatterCollectionRegistry.rewardsRecipient(_listingCollection(orders[orderIndex]));
+            address rewardsRecipient = _rewardsRecipient(orders[orderIndex], affiliate);
             Fees memory fees =
                 _computeListingFee(feeBaseAmount, appliedFeeBps, appliedFeeSplitBps, affiliate, rewardsRecipient);
             fillFees[i] = fees;
@@ -448,7 +537,109 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         uint256 maximumFeeBps
     ) external nonReentrant whenNotPaused {
         uint256 appliedFeeBps = _validatedFeeBps(maximumFeeBps);
-        uint256 appliedFeeSplitBps = feeSplitBps;
+        uint256 appliedFeeSplitBps = _feeSplitBps;
+        (
+            AdvancedOrder[] memory orders,
+            bytes32[] memory orderHashes,
+            ConsiderationItem[][] memory originalConsiderations,
+            uint256 maximumScatterFee
+        ) = _prepareSweepERC20(
+            seaportFulfillAvailableCalldata,
+            erc20,
+            seaportTotalErc20Amount,
+            feeChargedOrderIndexes,
+            affiliate,
+            feeAuthorizationDeadline,
+            feeAuthorizationSignature,
+            appliedFeeBps
+        );
+
+        IERC20 token = IERC20(erc20);
+        uint256 balanceBefore = token.balanceOf(address(this));
+        _pullFunds(token, seaportTotalErc20Amount + maximumScatterFee);
+        _settleSweepERC20(
+            seaportFulfillAvailableCalldata,
+            token,
+            seaportTotalErc20Amount,
+            feeChargedOrderIndexes,
+            orders,
+            orderHashes,
+            originalConsiderations,
+            affiliate,
+            appliedFeeBps,
+            appliedFeeSplitBps,
+            balanceBefore
+        );
+    }
+
+    function sweepERC20WithExchange(
+        SeaportErc20Sweep calldata seaportSweep,
+        bytes calldata exchangeBuyCalldata,
+        uint256 exchangeErc20Amount
+    ) external nonReentrant whenNotPaused {
+        uint256 appliedFeeBps = _validatedFeeBps(seaportSweep.maximumFeeBps);
+        uint256 appliedFeeSplitBps = _feeSplitBps;
+        _validateExchangeBuyCalldata(exchangeBuyCalldata);
+        (
+            AdvancedOrder[] memory orders,
+            bytes32[] memory orderHashes,
+            ConsiderationItem[][] memory originalConsiderations,
+            uint256 maximumScatterFee
+        ) = _prepareSweepERC20(
+            seaportSweep.fulfillAvailableCalldata,
+            seaportSweep.erc20,
+            seaportSweep.totalErc20Amount,
+            seaportSweep.feeChargedOrderIndexes,
+            seaportSweep.affiliate,
+            seaportSweep.feeAuthorizationDeadline,
+            seaportSweep.feeAuthorizationSignature,
+            appliedFeeBps
+        );
+
+        IERC20 token = IERC20(seaportSweep.erc20);
+        uint256 balanceBefore = token.balanceOf(address(this));
+        _pullFunds(token, exchangeErc20Amount + seaportSweep.totalErc20Amount + maximumScatterFee);
+        if (exchangeErc20Amount > 0) {
+            token.forceApprove(SCATTER_EXCHANGE, exchangeErc20Amount);
+        }
+        _executeExchangeBuy(exchangeBuyCalldata, 0);
+        if (exchangeErc20Amount > 0) {
+            token.forceApprove(SCATTER_EXCHANGE, 0);
+        }
+        _settleSweepERC20(
+            seaportSweep.fulfillAvailableCalldata,
+            token,
+            seaportSweep.totalErc20Amount,
+            seaportSweep.feeChargedOrderIndexes,
+            orders,
+            orderHashes,
+            originalConsiderations,
+            seaportSweep.affiliate,
+            appliedFeeBps,
+            appliedFeeSplitBps,
+            balanceBefore
+        );
+    }
+
+    function _prepareSweepERC20(
+        bytes calldata seaportFulfillAvailableCalldata,
+        address erc20,
+        uint256 seaportTotalErc20Amount,
+        uint256[] calldata feeChargedOrderIndexes,
+        address affiliate,
+        uint256 feeAuthorizationDeadline,
+        bytes calldata feeAuthorizationSignature,
+        uint256 appliedFeeBps
+    )
+        internal
+        view
+        returns (
+            AdvancedOrder[] memory orders,
+            bytes32[] memory orderHashes,
+            ConsiderationItem[][] memory originalConsiderations,
+            uint256 maximumScatterFee
+        )
+    {
         if (erc20 == address(0) || seaportTotalErc20Amount == 0) {
             revert InvalidListingAmount();
         }
@@ -458,17 +649,15 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         ) {
             revert InvalidSweepCalldataSelector();
         }
-        AdvancedOrder[] memory orders = _decodeAndValidateSweepOrders(seaportFulfillAvailableCalldata[4:]);
+        orders = _decodeAndValidateSweepOrders(seaportFulfillAvailableCalldata[4:]);
         for (uint256 i = 0; i < feeChargedOrderIndexes.length; i++) {
             if (i > 0 && feeChargedOrderIndexes[i] <= feeChargedOrderIndexes[i - 1]) {
                 revert InvalidSweepOrderIndex();
             }
         }
 
-        bytes32[] memory orderHashes = new bytes32[](feeChargedOrderIndexes.length);
-        ConsiderationItem[][] memory originalConsiderations = new ConsiderationItem[][](feeChargedOrderIndexes.length);
-        OrderFillStatus[] memory fillStatusesBefore = new OrderFillStatus[](feeChargedOrderIndexes.length);
-        uint256 maximumScatterFee;
+        orderHashes = new bytes32[](feeChargedOrderIndexes.length);
+        originalConsiderations = new ConsiderationItem[][](feeChargedOrderIndexes.length);
         uint256 feeIndex;
 
         for (uint256 orderIndex = 0; orderIndex < orders.length; orderIndex++) {
@@ -479,14 +668,7 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
                 continue;
             }
 
-            uint256 totalOriginalConsiderationItems = parameters.totalOriginalConsiderationItems;
-            if (totalOriginalConsiderationItems != parameters.consideration.length) {
-                revert InvalidTotalOriginalConsiderationItems();
-            }
-            ConsiderationItem[] memory originalConsideration = new ConsiderationItem[](totalOriginalConsiderationItems);
-            for (uint256 j = 0; j < totalOriginalConsiderationItems; j++) {
-                originalConsideration[j] = parameters.consideration[j];
-            }
+            ConsiderationItem[] memory originalConsideration = _originalConsideration(orders[orderIndex]);
 
             bytes32 orderHash = _orderHash(orders[orderIndex], originalConsideration);
             for (uint256 j = 0; j < feeIndex; j++) {
@@ -509,14 +691,27 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         _validateFeeAuthorization(
             affiliate, keccak256(abi.encode(orderHashes)), feeAuthorizationDeadline, feeAuthorizationSignature
         );
+    }
 
-        IERC20 token = IERC20(erc20);
-        uint256 balanceBefore = token.balanceOf(address(this));
-        _pullFunds(token, seaportTotalErc20Amount + maximumScatterFee);
+    function _settleSweepERC20(
+        bytes calldata seaportFulfillAvailableCalldata,
+        IERC20 token,
+        uint256 seaportTotalErc20Amount,
+        uint256[] calldata feeChargedOrderIndexes,
+        AdvancedOrder[] memory orders,
+        bytes32[] memory orderHashes,
+        ConsiderationItem[][] memory originalConsiderations,
+        address affiliate,
+        uint256 appliedFeeBps,
+        uint256 appliedFeeSplitBps,
+        uint256 balanceBefore
+    ) internal {
         _approveSeaport(token, seaportTotalErc20Amount);
         uint256 balanceBeforeFills = token.balanceOf(address(this));
-        // Snapshot the fill statuses only after the currency pull: its transfer
-        // hooks can reenter Seaport, and those fills must not be charged.
+        // Snapshot the fill statuses only after the currency pull and any
+        // exchange settlement: their hooks can reenter Seaport, and those
+        // fills must not be charged.
+        OrderFillStatus[] memory fillStatusesBefore = new OrderFillStatus[](orderHashes.length);
         for (uint256 i = 0; i < orderHashes.length; i++) {
             fillStatusesBefore[i] = _getOrderFillStatus(orderHashes[i]);
         }
@@ -535,7 +730,8 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
             (fillNumerators[i], fillDenominators[i]) = _orderFillDelta(orderHashes[i], fillStatusesBefore[i]);
         }
 
-        uint256 seaportAmountSpent = balanceBeforeFills - token.balanceOf(address(this));
+        uint256 balanceAfterFills = token.balanceOf(address(this));
+        uint256 seaportAmountSpent = balanceBeforeFills > balanceAfterFills ? balanceBeforeFills - balanceAfterFills : 0;
         _disapproveSeaport(token);
 
         Fees memory aggregateFees;
@@ -546,12 +742,11 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
             uint256 feeBaseAmount = _deriveErc20FeeBase(
                 orders[orderIndex].parameters.orderType,
                 originalConsiderations[i],
-                erc20,
+                address(token),
                 fillNumerators[i],
                 fillDenominators[i]
             );
-            address rewardsRecipient =
-                scatterCollectionRegistry.rewardsRecipient(_listingCollection(orders[orderIndex]));
+            address rewardsRecipient = _rewardsRecipient(orders[orderIndex], affiliate);
             Fees memory fees =
                 _computeListingFee(feeBaseAmount, appliedFeeBps, appliedFeeSplitBps, affiliate, rewardsRecipient);
             fillFees[i] = fees;
@@ -559,10 +754,11 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
             aggregateFees.platformAmount += fees.platformAmount;
             aggregateFees.rewardsAmount += fees.rewardsAmount;
             aggregateFees.affiliateAmount += fees.affiliateAmount;
+            if (fees.affiliateAmount > 0) aggregateFees.affiliate = fees.affiliate;
 
             emit ExternalListingFilled(
                 msg.sender,
-                erc20,
+                address(token),
                 orderHashes[i],
                 feeBaseAmount,
                 fees.totalAmount,
@@ -574,21 +770,49 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
             );
         }
 
-        for (uint256 i = 0; i < fillFees.length; i++) {
-            _distributeFeesErc20(token, fillFees[i]);
-        }
+        _distributeSweepFeesErc20(token, aggregateFees, fillFees);
 
-        _refundLeftoverErc20(token, balanceBefore, token.balanceOf(address(this)));
+        uint256 balanceAfter = token.balanceOf(address(this));
+        if (balanceAfter < balanceBefore) revert InsufficientPayment();
+        _refundLeftoverErc20(token, balanceBefore, balanceAfter);
 
         emit SweepERC20Filled(
             msg.sender,
-            erc20,
+            address(token),
             seaportAmountSpent,
             aggregateFees.totalAmount,
             aggregateFees.platformAmount,
             aggregateFees.rewardsAmount,
             aggregateFees.affiliateAmount
         );
+    }
+
+    function _validateExchangeBuyCalldata(bytes calldata exchangeBuyCalldata) internal view {
+        // buyListings(FillInput[],address,address,uint256,bytes) has 5 static head words (160 bytes) after the selector.
+        if (exchangeBuyCalldata.length < 4 + 160 || bytes4(exchangeBuyCalldata[0:4]) != EXCHANGE_BUY_LISTINGS_SELECTOR)
+        {
+            revert InvalidExchangeCalldata();
+        }
+        uint256 inputsOffset = abi.decode(exchangeBuyCalldata[4:36], (uint256));
+        if (inputsOffset > exchangeBuyCalldata.length - 36) revert InvalidExchangeCalldata();
+        uint256 inputsLength = abi.decode(exchangeBuyCalldata[4 + inputsOffset:36 + inputsOffset], (uint256));
+        if (inputsLength == 0) revert EmptyExchangeSweep();
+
+        address recipient = abi.decode(exchangeBuyCalldata[36:68], (address));
+        if (recipient == address(0) || recipient == address(this)) {
+            revert InvalidSweepRecipient();
+        }
+    }
+
+    function _executeExchangeBuy(bytes calldata exchangeBuyCalldata, uint256 nativeValue) internal {
+        activeRoutedFulfiller = msg.sender;
+        (bool success, bytes memory returndata) = SCATTER_EXCHANGE.call{value: nativeValue}(exchangeBuyCalldata);
+        activeRoutedFulfiller = address(0);
+        if (!success) {
+            assembly ("memory-safe") {
+                revert(add(returndata, 32), mload(returndata))
+            }
+        }
     }
 
     function setFeeAuthorizer(address newFeeAuthorizer) external onlyOwner {
@@ -599,18 +823,20 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
 
     function setFeeBps(uint256 newFeeBps) external onlyOwner {
         if (newFeeBps > MAX_FEE_BPS) revert InvalidFeeBps();
-        emit FeeBpsUpdated(feeBps, newFeeBps);
-        feeBps = newFeeBps;
+        emit FeeBpsUpdated(_feeBps, newFeeBps);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        _feeBps = uint16(newFeeBps);
     }
 
     function setFeeSplitBps(uint256 newFeeSplitBps) external onlyOwner {
         if (newFeeSplitBps > BPS_DENOMINATOR) revert InvalidFeeSplitBps();
-        emit FeeSplitBpsUpdated(feeSplitBps, newFeeSplitBps);
-        feeSplitBps = newFeeSplitBps;
+        emit FeeSplitBpsUpdated(_feeSplitBps, newFeeSplitBps);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        _feeSplitBps = uint16(newFeeSplitBps);
     }
 
     function _validatedFeeBps(uint256 maximumFeeBps) internal view returns (uint256 currentFeeBps) {
-        currentFeeBps = feeBps;
+        currentFeeBps = _feeBps;
         if (currentFeeBps > maximumFeeBps) revert FeeBpsExceedsLimit(currentFeeBps, maximumFeeBps);
     }
 
@@ -641,6 +867,12 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         if (ECDSA.recover(digest, signature) != feeAuthorizer) revert InvalidFeeAuthorization();
     }
 
+    function _rewardsRecipient(AdvancedOrder memory order, address affiliate) internal view returns (address) {
+        address collection = _listingCollection(order);
+        if (affiliate != address(0)) return address(0);
+        return scatterCollectionRegistry.rewardsRecipient(collection);
+    }
+
     function _computeListingFee(
         uint256 listingPrice,
         uint256 appliedFeeBps,
@@ -648,33 +880,22 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         address affiliate,
         address rewardsRecipient
     ) internal pure returns (Fees memory fees) {
+        fees.totalAmount = Math.mulDiv(listingPrice, appliedFeeBps, BPS_DENOMINATOR);
         if (affiliate != address(0)) {
-            fees.totalAmount = Math.mulDiv(listingPrice, appliedFeeBps, BPS_DENOMINATOR);
             fees.platformAmount = Math.mulDiv(fees.totalAmount, appliedFeeSplitBps, BPS_DENOMINATOR);
             fees.affiliateAmount = fees.totalAmount - fees.platformAmount;
-            fees.rewardsAmount = 0;
             fees.affiliate = affiliate;
-            fees.rewardsRecipient = address(0);
             return fees;
         }
 
         if (rewardsRecipient != address(0)) {
-            fees.totalAmount = Math.mulDiv(listingPrice, appliedFeeBps, BPS_DENOMINATOR);
             fees.platformAmount = Math.mulDiv(fees.totalAmount, appliedFeeSplitBps, BPS_DENOMINATOR);
-            fees.affiliateAmount = 0;
             fees.rewardsAmount = fees.totalAmount - fees.platformAmount;
-            fees.affiliate = address(0);
             fees.rewardsRecipient = rewardsRecipient;
             return fees;
         }
 
-        fees.totalAmount = Math.mulDiv(listingPrice, appliedFeeBps, BPS_DENOMINATOR);
         fees.platformAmount = fees.totalAmount;
-        fees.affiliateAmount = 0;
-        fees.rewardsAmount = 0;
-        fees.affiliate = address(0);
-        fees.rewardsRecipient = address(0);
-        return fees;
     }
 
     struct OrderFillStatus {
@@ -740,23 +961,14 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         return true;
     }
 
-    function _originalConsideration(AdvancedOrder memory order)
-        internal
-        pure
-        returns (ConsiderationItem[] memory originalConsideration)
-    {
+    function _originalConsideration(AdvancedOrder memory order) internal pure returns (ConsiderationItem[] memory) {
         // Consideration beyond the signed items is paid by Seaport but not
         // covered by the fee, so fee-charged orders must carry exactly the
         // signed items.
-        uint256 totalOriginalConsiderationItems = order.parameters.totalOriginalConsiderationItems;
-        if (totalOriginalConsiderationItems != order.parameters.consideration.length) {
+        if (order.parameters.totalOriginalConsiderationItems != order.parameters.consideration.length) {
             revert InvalidTotalOriginalConsiderationItems();
         }
-
-        originalConsideration = new ConsiderationItem[](totalOriginalConsiderationItems);
-        for (uint256 i = 0; i < totalOriginalConsiderationItems; i++) {
-            originalConsideration[i] = order.parameters.consideration[i];
-        }
+        return order.parameters.consideration;
     }
 
     function _orderHash(AdvancedOrder memory order, ConsiderationItem[] memory originalConsideration)
@@ -891,9 +1103,9 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
         internal
         returns (bool[] memory fillsCompleted)
     {
-        _activeRoutedFulfiller = msg.sender;
+        activeRoutedFulfiller = msg.sender;
         (bool success, bytes memory result) = SEAPORT.call{value: amountNative}(seaportFulfillAvailableCalldata);
-        _activeRoutedFulfiller = address(0);
+        activeRoutedFulfiller = address(0);
         if (!success) revert SeaportCallFailed();
         if (result.length == 0) revert SeaportCallFailed();
 
@@ -901,9 +1113,9 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
     }
 
     function _seaportFulfillmentCall(bytes calldata seaportFulfillCalldata, uint256 value) internal {
-        _activeRoutedFulfiller = msg.sender;
+        activeRoutedFulfiller = msg.sender;
         (bool success, bytes memory returndata) = SEAPORT.call{value: value}(seaportFulfillCalldata);
-        _activeRoutedFulfiller = address(0);
+        activeRoutedFulfiller = address(0);
         if (!success) revert SeaportCallFailed();
         if (returndata.length != 32 || !abi.decode(returndata, (bool))) revert SeaportCallFailed();
     }
@@ -958,6 +1170,23 @@ contract ScatterAggregatorRouter is Ownable2Step, Pausable, ReentrancyGuard, EIP
 
         if (fees.affiliateAmount > 0) {
             token.safeTransfer(fees.affiliate, fees.affiliateAmount);
+        }
+    }
+
+    function _distributeSweepFeesErc20(IERC20 token, Fees memory aggregateFees, Fees[] memory fillFees) internal {
+        if (aggregateFees.platformAmount > 0) {
+            token.safeTransfer(PLATFORM, aggregateFees.platformAmount);
+        }
+
+        for (uint256 i = 0; i < fillFees.length; i++) {
+            Fees memory fees = fillFees[i];
+            if (fees.rewardsAmount > 0) {
+                token.safeTransfer(fees.rewardsRecipient, fees.rewardsAmount);
+            }
+        }
+
+        if (aggregateFees.affiliateAmount > 0) {
+            token.safeTransfer(aggregateFees.affiliate, aggregateFees.affiliateAmount);
         }
     }
 

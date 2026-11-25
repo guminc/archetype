@@ -11,7 +11,7 @@ import {FactoryErc721a} from "../src/ERC721a/FactoryErc721a.sol";
 import {MintFeeRegistry} from "../src/MintFeeRegistry.sol";
 import {AffiliateSignerRegistry} from "../src/AffiliateSignerRegistry.sol";
 import {MintConstraints} from "../src/MintConstraints.sol";
-import {RoyaltyPolicyRegistry} from "../src/RoyaltyPolicyRegistry.sol";
+import {ScatterCollectionRegistry} from "../src/ScatterCollectionRegistry.sol";
 import {TestErc20} from "../src/TestErc20.sol";
 
 contract ArchetypeBatchV100Test is Test {
@@ -27,7 +27,7 @@ contract ArchetypeBatchV100Test is Test {
     ArchetypeBatchV100 internal batch;
     MintFeeRegistry internal feeRegistry;
     AffiliateSignerRegistry internal affiliateSignerRegistry;
-    RoyaltyPolicyRegistry internal royaltyPolicyRegistry;
+    ScatterCollectionRegistry internal scatterCollectionRegistry;
     ArchetypeErc721a internal archetype;
     FactoryErc721a internal factory;
 
@@ -36,22 +36,22 @@ contract ArchetypeBatchV100Test is Test {
         vm.deal(buyer, 100 ether);
 
         payouts = new ArchetypePayouts();
-        royaltyPolicyRegistry = new RoyaltyPolicyRegistry(owner);
-        batch = new ArchetypeBatchV100(owner, royaltyPolicyRegistry);
+        scatterCollectionRegistry = new ScatterCollectionRegistry(owner);
+        batch = new ArchetypeBatchV100(owner, scatterCollectionRegistry);
         feeRegistry = new MintFeeRegistry(owner, owner, 0, 1 ether, 0);
         affiliateSignerRegistry = new AffiliateSignerRegistry(owner, AFFILIATE_SIGNER);
         archetype =
             new ArchetypeErc721a(PLATFORM, address(payouts), address(batch), feeRegistry, affiliateSignerRegistry);
 
         vm.startPrank(owner);
-        factory = new FactoryErc721a(address(archetype), owner, royaltyPolicyRegistry);
-        royaltyPolicyRegistry.setApprovedFactory(address(factory), true);
+        factory = new FactoryErc721a(address(archetype), owner, scatterCollectionRegistry);
+        scatterCollectionRegistry.setApprovedFactory(address(factory), true);
         vm.stopPrank();
     }
 
     function test_constructor_rejectsAMissingRegistry() public {
         vm.expectRevert(ArchetypeBatchV100.InvalidRoyaltyPolicyRegistry.selector);
-        new ArchetypeBatchV100(owner, RoyaltyPolicyRegistry(address(0)));
+        new ArchetypeBatchV100(owner, ScatterCollectionRegistry(address(0)));
     }
 
     function test_executeBatch_mintsFromEveryListWithTheExactNativePayment() public {
@@ -139,7 +139,7 @@ contract ArchetypeBatchV100Test is Test {
     function test_executeBatch_rejectsACollectionWiredToAnotherBatch() public {
         ArchetypeErc721a collection = _createCollection();
         _setPublicInvite(collection, 0);
-        ArchetypeBatchV100 otherBatch = new ArchetypeBatchV100(owner, royaltyPolicyRegistry);
+        ArchetypeBatchV100 otherBatch = new ArchetypeBatchV100(owner, scatterCollectionRegistry);
 
         address[] memory targets = new address[](1);
         uint256[] memory values = new uint256[](1);
@@ -159,7 +159,7 @@ contract ArchetypeBatchV100Test is Test {
         address[] memory registered = new address[](1);
         registered[0] = address(target);
         vm.prank(owner);
-        royaltyPolicyRegistry.registerScatterCollections(registered);
+        scatterCollectionRegistry.registerScatterCollections(registered);
 
         address[] memory targets = new address[](1);
         uint256[] memory values = new uint256[](1);

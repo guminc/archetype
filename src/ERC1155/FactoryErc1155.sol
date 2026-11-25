@@ -19,11 +19,11 @@ import "./ArchetypeErc1155.sol";
 import "./ArchetypeLogicErc1155.sol";
 import "openzeppelin-v4/proxy/Clones.sol";
 import "openzeppelin-v4/access/Ownable.sol";
-import {RoyaltyPolicyRegistry} from "../RoyaltyPolicyRegistry.sol";
+import {ScatterCollectionRegistry} from "../ScatterCollectionRegistry.sol";
 
 error InsufficientDeployFee();
 error InvalidOwner();
-error InvalidRoyaltyPolicyRegistry();
+error InvalidRewardsPolicyRegistry();
 
 contract FactoryErc1155 is Ownable {
     event CollectionAdded(address indexed sender, address indexed receiver, address collection);
@@ -31,14 +31,14 @@ contract FactoryErc1155 is Ownable {
 
     address public archetype;
     uint256 public deployFee;
-    RoyaltyPolicyRegistry public immutable royaltyPolicyRegistry;
+    ScatterCollectionRegistry public immutable rewardsPolicyRegistry;
     mapping(address => uint256) public senderSaltNonce;
 
-    constructor(address archetype_, address owner_, RoyaltyPolicyRegistry royaltyPolicyRegistry_) {
+    constructor(address archetype_, address owner_, ScatterCollectionRegistry rewardsPolicyRegistry_) {
         if (owner_ == address(0)) revert InvalidOwner();
-        if (address(royaltyPolicyRegistry_).code.length == 0) revert InvalidRoyaltyPolicyRegistry();
+        if (address(rewardsPolicyRegistry_).code.length == 0) revert InvalidRewardsPolicyRegistry();
         archetype = archetype_;
-        royaltyPolicyRegistry = royaltyPolicyRegistry_;
+        rewardsPolicyRegistry = rewardsPolicyRegistry_;
         _transferOwnership(owner_);
     }
 
@@ -58,7 +58,7 @@ contract FactoryErc1155 is Ownable {
         ArchetypeErc1155 token = ArchetypeErc1155(clone);
         token.initialize(name, symbol, config, payoutConfig, _receiver);
         token.transferOwnership(_receiver);
-        royaltyPolicyRegistry.registerScatterCollection(clone);
+        rewardsPolicyRegistry.registerScatterCollection(clone);
 
         if (deployFee > 0) {
             ArchetypeAddresses memory addrs = ArchetypeErc1155(archetype).archetypeAddresses();

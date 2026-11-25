@@ -11,7 +11,7 @@ import {FactoryErc1155} from "../src/ERC1155/FactoryErc1155.sol";
 import {MintFeeRegistry} from "../src/MintFeeRegistry.sol";
 import {AffiliateSignerRegistry} from "../src/AffiliateSignerRegistry.sol";
 import {MintConstraints} from "../src/MintConstraints.sol";
-import {RoyaltyPolicyRegistry} from "../src/RoyaltyPolicyRegistry.sol";
+import {ScatterCollectionRegistry} from "../src/ScatterCollectionRegistry.sol";
 import {TestErc20} from "../src/TestErc20.sol";
 
 contract V100AuditErc1155PocsTest is Test {
@@ -31,7 +31,7 @@ contract V100AuditErc1155PocsTest is Test {
     MintFeeRegistry internal feeRegistry;
     AffiliateSignerRegistry internal affiliateSignerRegistry;
     ArchetypeErc1155 internal archetype;
-    RoyaltyPolicyRegistry internal royaltyRegistry;
+    ScatterCollectionRegistry internal rewardsRegistry;
     FactoryErc1155 internal factory;
 
     function setUp() public {
@@ -40,16 +40,16 @@ contract V100AuditErc1155PocsTest is Test {
         vm.deal(other, 100 ether);
 
         payouts = new ArchetypePayouts();
-        royaltyRegistry = new RoyaltyPolicyRegistry(owner);
-        batch = new ArchetypeBatchV100(owner, royaltyRegistry);
+        rewardsRegistry = new ScatterCollectionRegistry(owner);
+        batch = new ArchetypeBatchV100(owner, rewardsRegistry);
         feeRegistry = new MintFeeRegistry(owner, owner, 0, 1 ether, 0);
         affiliateSignerRegistry = new AffiliateSignerRegistry(owner, vm.addr(AFFILIATE_SIGNER_PK));
         archetype =
             new ArchetypeErc1155(PLATFORM, address(payouts), address(batch), feeRegistry, affiliateSignerRegistry);
 
         vm.startPrank(owner);
-        factory = new FactoryErc1155(address(archetype), owner, royaltyRegistry);
-        royaltyRegistry.setApprovedFactory(address(factory), true);
+        factory = new FactoryErc1155(address(archetype), owner, rewardsRegistry);
+        rewardsRegistry.setApprovedFactory(address(factory), true);
         vm.stopPrank();
     }
 

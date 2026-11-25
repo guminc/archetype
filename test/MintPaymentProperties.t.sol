@@ -7,6 +7,7 @@ import {
     Config,
     Invite,
     MintPayment,
+    MintPricing,
     PayoutConfig
 } from "../src/ERC721a/ArchetypeLogicErc721a.sol";
 
@@ -17,6 +18,7 @@ contract MintPaymentPropertiesTest is Test {
     Invite internal invite;
     Config internal config;
     PayoutConfig internal payoutConfig;
+    MintPricing internal pricing;
 
     function testFuzz_publicNativeMintChargesTheLargerPlatformFee(uint64 price, uint32 nativeMinimumFee) public {
         invite.price = price;
@@ -25,7 +27,7 @@ contract MintPaymentPropertiesTest is Test {
         payoutConfig.platformBps = 500;
 
         MintPayment memory payment = ArchetypeLogicErc721a.computeMintPayment(
-            invite, config, payoutConfig, PUBLIC_KEY, 2, true, nativeMinimumFee
+            invite, config, payoutConfig, pricing, PUBLIC_KEY, 2, true, nativeMinimumFee
         );
 
         uint256 currencyCost = uint256(price) * 2;
@@ -44,8 +46,9 @@ contract MintPaymentPropertiesTest is Test {
         invite.tokenAddress = address(1);
         bytes32 key = keccak256(abi.encodePacked(invite.tokenAddress));
 
-        MintPayment memory payment =
-            ArchetypeLogicErc721a.computeMintPayment(invite, config, payoutConfig, key, 2, false, nativeMinimumFee);
+        MintPayment memory payment = ArchetypeLogicErc721a.computeMintPayment(
+            invite, config, payoutConfig, pricing, key, 2, false, nativeMinimumFee
+        );
 
         uint256 minimumFee = uint256(nativeMinimumFee) * 2;
         assertEq(payment.currencyCost, uint256(price) * 2);
@@ -58,7 +61,7 @@ contract MintPaymentPropertiesTest is Test {
         invite.tokenAddress = address(0);
 
         MintPayment memory payment = ArchetypeLogicErc721a.computeMintPayment(
-            invite, config, payoutConfig, PRIVATE_KEY, 2, false, nativeMinimumFee
+            invite, config, payoutConfig, pricing, PRIVATE_KEY, 2, false, nativeMinimumFee
         );
 
         uint256 currencyCost = uint256(price) * 2;

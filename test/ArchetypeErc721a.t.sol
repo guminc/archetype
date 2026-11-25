@@ -17,10 +17,13 @@ import {
     InvalidPayouts
 } from "../src/ArchetypePayouts.sol";
 import {TestErc20} from "../src/TestErc20.sol";
-import {RoyaltyPolicyRegistry} from "../src/RoyaltyPolicyRegistry.sol";
+import {ScatterCollectionRegistry} from "../src/ScatterCollectionRegistry.sol";
 import {NoReturnErc20} from "./mocks/NoReturnErc20.sol";
 import {FeeOnTransferErc20} from "./mocks/FeeOnTransferErc20.sol";
 import {ReentrantAffiliate} from "./mocks/ReentrantAffiliate.sol";
+import {MetadataRenderer, MalformedMetadataRenderer} from "./mocks/MetadataRenderer.sol";
+import {MintCallback} from "./mocks/MintCallback.sol";
+import {Reentrancy} from "../src/TransientReentrancyGuard.sol";
 import {MintFeeRegistry} from "../src/MintFeeRegistry.sol";
 import {AffiliateSignerRegistry} from "../src/AffiliateSignerRegistry.sol";
 import {
@@ -64,6 +67,7 @@ import {
 } from "../src/ERC721a/FactoryErc721a.sol";
 
 contract ArchetypeErc721aTest is Test {
+    event BatchMetadataUpdate(uint256 _fromTokenId, uint256 _toTokenId);
     address internal constant PLATFORM = 0x2222222222222222222222222222222222222221;
     address internal constant BATCH = 0x2222222222222222222222222222222222222223;
     address internal constant PAYOUTS = 0x2222222222222222222222222222222222222222;
@@ -77,7 +81,7 @@ contract ArchetypeErc721aTest is Test {
 
     ArchetypeErc721a internal archetypeImplementation;
     FactoryErc721a internal factory;
-    RoyaltyPolicyRegistry internal royaltyPolicyRegistry;
+    ScatterCollectionRegistry internal scatterCollectionRegistry;
     MintFeeRegistry internal mintFeeRegistry;
     AffiliateSignerRegistry internal affiliateSignerRegistry;
 
@@ -122,8 +126,8 @@ contract ArchetypeErc721aTest is Test {
         ArchetypePayouts payoutsImpl = new ArchetypePayouts();
         vm.etch(PAYOUTS, address(payoutsImpl).code);
 
-        royaltyPolicyRegistry = new RoyaltyPolicyRegistry(owner);
-        ArchetypeBatchV100 batchImpl = new ArchetypeBatchV100(address(this), royaltyPolicyRegistry);
+        scatterCollectionRegistry = new ScatterCollectionRegistry(owner);
+        ArchetypeBatchV100 batchImpl = new ArchetypeBatchV100(address(this), scatterCollectionRegistry);
         vm.etch(BATCH, address(batchImpl).code);
 
         mintFeeRegistry = new MintFeeRegistry(owner, other, 0, 1 ether, 0);
@@ -132,8 +136,8 @@ contract ArchetypeErc721aTest is Test {
             new ArchetypeErc721a(PLATFORM, PAYOUTS, BATCH, mintFeeRegistry, affiliateSignerRegistry);
 
         _prank(owner);
-        factory = new FactoryErc721a(address(archetypeImplementation), owner, royaltyPolicyRegistry);
-        royaltyPolicyRegistry.setApprovedFactory(address(factory), true);
+        factory = new FactoryErc721a(address(archetypeImplementation), owner, scatterCollectionRegistry);
+        scatterCollectionRegistry.setApprovedFactory(address(factory), true);
 
         _prank(other);
     }
@@ -175,7 +179,7 @@ contract ArchetypeErc721aTest is Test {
     function test_factoryConstructor_setsOwnerFromArgument() public {
         _prank(other);
         FactoryErc721a factoryWithOwnerArg =
-            new FactoryErc721a(address(archetypeImplementation), owner, royaltyPolicyRegistry);
+            new FactoryErc721a(address(archetypeImplementation), owner, scatterCollectionRegistry);
 
         assertEq(factoryWithOwnerArg.owner(), owner);
         assertEq(factoryWithOwnerArg.archetype(), address(archetypeImplementation));
@@ -183,7 +187,7 @@ contract ArchetypeErc721aTest is Test {
 
     function test_factoryConstructor_failsWhenOwnerIsZero() public {
         vm.expectRevert(FactoryInvalidOwner.selector);
-        new FactoryErc721a(address(archetypeImplementation), address(0), royaltyPolicyRegistry);
+        new FactoryErc721a(address(archetypeImplementation), address(0), scatterCollectionRegistry);
     }
 
     function test_createCollection_initializesClone() public {
@@ -192,7 +196,7 @@ contract ArchetypeErc721aTest is Test {
 
         assertEq(collection.symbol(), "POOKIE");
         assertEq(collection.owner(), owner);
-        assertTrue(royaltyPolicyRegistry.scatterCollections(address(collection)));
+        assertTrue(scatterCollectionRegistry.scatterCollections(address(collection)));
     }
 
     function test_createCollection_allowsTheSameSenderTwiceInOneBlock() public {
@@ -1102,6 +1106,450 @@ contract ArchetypeErc721aTest is Test {
         _prank(buyer);
         vm.expectRevert(MintCostOverflow.selector);
         collection.mint(_publicAuth(), 2, address(0), "", _constraints());
+    }
+
+    function test_mintCallback_allMintPathsAndReceiverOrdering() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        MintCallback callback = new MintCallback(collection);
+        _setPublicInvite(collection, 0, uint32(block.timestamp));
+        collection.setMetadataRenderer(address(new MetadataRenderer()));
+        _mint(collection, buyer, _publicAuth(), 1, 0);
+        assertEq(callback.count(), 0);
+
+        _prank(owner);
+        collection.setMintCallback(address(callback));
+        BonusDiscount[] memory discounts = new BonusDiscount[](1);
+        discounts[0] = BonusDiscount({numMints: 2, numBonusMints: 1});
+        collection.setBonusInvite(
+            PUBLIC_KEY,
+            CID_ZERO,
+            Invite({
+                price: 0,
+                start: uint32(block.timestamp),
+                end: 0,
+                limit: 100,
+                maxSupply: 100,
+                unitSize: 2,
+                tokenAddress: address(0),
+                isBlacklist: false
+            }),
+            discounts
+        );
+        _mint(collection, buyer, _publicAuth(), 1, 0);
+        assertEq(callback.count(), 3);
+        for (uint256 id = 2; id <= 4; ++id) {
+            assertEq(callback.owners(id), buyer);
+        }
+
+        _prank(buyer);
+        collection.mintTo(_publicAuth(), 1, other, address(0), "", _constraints());
+        assertEq(callback.count(), 6);
+        for (uint256 id = 5; id <= 7; ++id) {
+            assertEq(callback.owners(id), other);
+        }
+        address[] memory recipients = new address[](2);
+        recipients[0] = buyer;
+        recipients[1] = other;
+        uint256[] memory quantities = new uint256[](2);
+        quantities[0] = 1;
+        quantities[1] = 2;
+        _prank(owner);
+        collection.batchMintTo(_publicAuth(), _batchMintArgs(recipients, quantities, _constraints()));
+        assertEq(callback.count(), 15);
+        assertEq(collection.totalSupply(), 16);
+        for (uint256 id = 8; id <= 10; ++id) {
+            assertEq(callback.owners(id), buyer);
+        }
+        for (uint256 id = 11; id <= 16; ++id) {
+            assertEq(callback.owners(id), other);
+        }
+        _prank(buyer);
+        collection.transferFrom(buyer, other, 2);
+        assertEq(callback.count(), 15);
+
+        ArchetypeErc721a receiverCollection = _createCollection(owner);
+        MintCallback receiver = new MintCallback(receiverCollection);
+        _setPublicInvite(receiverCollection, 0, uint32(block.timestamp));
+        receiverCollection.setMintCallback(address(receiver));
+        _prank(buyer);
+        receiverCollection.mintTo(_publicAuth(), 3, address(receiver), address(0), "", _constraints());
+        assertEq(receiver.count(), 3);
+        assertEq(receiver.received(), 3);
+    }
+
+    function test_mintCallback_failureRollsBackBatchPaymentsAndLimits() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        MintCallback callback = new MintCallback(collection);
+        _setInvite(
+            collection,
+            PUBLIC_KEY,
+            Invite({
+                price: 0.1 ether,
+                start: uint32(block.timestamp),
+                end: 0,
+                limit: 10,
+                maxSupply: 100,
+                unitSize: 1,
+                tokenAddress: address(0),
+                isBlacklist: false
+            })
+        );
+        collection.setMintCallback(address(callback));
+        callback.setFailAt(3);
+        address[] memory recipients = new address[](2);
+        recipients[0] = buyer;
+        recipients[1] = other;
+        uint256[] memory quantities = new uint256[](2);
+        quantities[0] = 2;
+        quantities[1] = 2;
+        uint256 balanceBefore = owner.balance;
+        uint256 payoutsBefore = PAYOUTS.balance;
+        vm.expectRevert(MintCallback.CommitmentFailed.selector);
+        collection.batchMintTo{value: 0.4 ether}(_publicAuth(), _batchMintArgs(recipients, quantities, _constraints()));
+        assertEq(collection.totalSupply(), 0);
+        assertEq(collection.balanceOf(buyer), 0);
+        assertEq(collection.balanceOf(other), 0);
+        assertEq(collection.minted(owner, PUBLIC_KEY), 0);
+        assertEq(collection.listSupply(PUBLIC_KEY), 0);
+        assertEq(callback.count(), 0);
+        assertEq(owner.balance, balanceBefore);
+        assertEq(PAYOUTS.balance, payoutsBefore);
+        callback.setFailAt(0);
+        collection.batchMintTo{value: 0.4 ether}(_publicAuth(), _batchMintArgs(recipients, quantities, _constraints()));
+        assertEq(callback.count(), 4);
+        assertEq(collection.ownerOf(1), buyer);
+        assertEq(collection.ownerOf(4), other);
+        assertEq(collection.minted(owner, PUBLIC_KEY), 4);
+        assertEq(collection.listSupply(PUBLIC_KEY), 4);
+    }
+
+    function test_mintCallback_burnOutputAndFailureRestoreSourceTokens() public {
+        ArchetypeErc721a source = _createCollection(owner);
+        vm.warp(block.timestamp + 1);
+        ArchetypeErc721a destination = _createCollection(owner);
+        MintCallback callback = new MintCallback(destination);
+        _setPublicInvite(source, 0, uint32(block.timestamp));
+        _mint(source, buyer, _publicAuth(), 2, 0);
+        _setBurnInvite(
+            destination,
+            ZERO_KEY,
+            BurnInvite({
+                burnErc721: IERC721(address(source)),
+                burnAddress: DEAD,
+                tokenAddress: address(0),
+                price: 0,
+                reversed: true,
+                ratio: 2,
+                start: uint32(block.timestamp),
+                end: 0,
+                limit: 10
+            })
+        );
+        destination.setMintCallback(address(callback));
+        callback.setFailAt(2);
+        _prank(buyer);
+        source.setApprovalForAll(address(destination), true);
+        vm.expectRevert(MintCallback.CommitmentFailed.selector);
+        destination.burnToMint(
+            _auth(ZERO_KEY), _rangeTokenIds(1, 2), _burnConstraints(address(source), DEAD, _constraints())
+        );
+        assertEq(source.ownerOf(1), buyer);
+        assertEq(source.ownerOf(2), buyer);
+        assertEq(destination.totalSupply(), 0);
+        assertEq(callback.count(), 0);
+        callback.setFailAt(0);
+        destination.burnToMint(
+            _auth(ZERO_KEY), _rangeTokenIds(1, 2), _burnConstraints(address(source), DEAD, _constraints())
+        );
+        assertEq(source.balanceOf(DEAD), 2);
+        assertEq(destination.balanceOf(buyer), 4);
+        assertEq(callback.count(), 4);
+        for (uint256 id = 1; id <= 4; ++id) {
+            assertEq(callback.owners(id), buyer);
+        }
+    }
+
+    function test_mintCallback_authorityDisableAndUriLock() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        MintCallback callback = new MintCallback(collection);
+        _setPublicInvite(collection, 0, uint32(block.timestamp));
+        _prank(buyer);
+        vm.expectRevert(NotOwner.selector);
+        collection.setMintCallback(address(callback));
+        _prank(owner);
+        vm.expectRevert(ArchetypeErc721a.InvalidMintCallback.selector);
+        collection.setMintCallback(other);
+        vm.expectRevert(ArchetypeErc721a.InvalidMintCallback.selector);
+        collection.setMintCallback(address(collection));
+        collection.setMintCallback(address(callback));
+        _mint(collection, buyer, _publicAuth(), 1, 0);
+        _prank(owner);
+        collection.transferOwnership(other);
+        vm.expectRevert(NotOwner.selector);
+        collection.setMintCallback(address(0));
+        _prank(other);
+        collection.setMintCallback(address(0));
+        _mint(collection, buyer, _publicAuth(), 1, 0);
+        assertEq(callback.count(), 1);
+        _prank(other);
+        collection.setMintCallback(address(callback));
+        collection.lockURI("forever");
+        vm.expectRevert(LockedForever.selector);
+        collection.setMintCallback(address(0));
+        vm.expectRevert(LockedForever.selector);
+        collection.setMintCallback(address(callback));
+        _mint(collection, buyer, _publicAuth(), 1, 0);
+        assertEq(callback.count(), 2);
+        assertEq(callback.owners(3), buyer);
+        assertEq(collection.mintCallback(), address(callback));
+    }
+
+    function test_mintCallback_blocksNestedMintsAndOwnerReconfiguration() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        MintCallback callback = new MintCallback(collection);
+        _setPublicInvite(collection, 0, uint32(block.timestamp));
+        collection.setMintCallback(address(callback));
+        collection.transferOwnership(address(callback));
+        callback.addAttempt(abi.encodeCall(collection.mint, (_publicAuth(), 1, address(0), "", _constraints())));
+        callback.addAttempt(
+            abi.encodeCall(collection.mintTo, (_publicAuth(), 1, buyer, address(0), "", _constraints()))
+        );
+        callback.addAttempt(
+            abi.encodeCall(
+                collection.batchMintTo,
+                (_publicAuth(), _batchMintArgs(new address[](0), new uint256[](0), _constraints()))
+            )
+        );
+        callback.addAttempt(
+            abi.encodeCall(
+                collection.burnToMint,
+                (_publicAuth(), new uint256[](0), _burnConstraints(address(collection), DEAD, _constraints()))
+            )
+        );
+        callback.addAttempt(abi.encodeCall(collection.setMintCallback, (address(0))));
+        _mint(collection, buyer, _publicAuth(), 2, 0);
+        for (uint256 i; i < 5; ++i) {
+            assertEq(callback.failures(i), abi.encodeWithSelector(Reentrancy.selector));
+        }
+        assertEq(collection.totalSupply(), 2);
+        assertEq(callback.count(), 2);
+        assertEq(collection.mintCallback(), address(callback));
+    }
+
+    function test_mintCallback_forwardedMintAndIncompatibleCallbackFailure() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        MintCallback callback = new MintCallback(collection);
+        _setPublicInvite(collection, 0, uint32(block.timestamp));
+        collection.setMintCallback(address(callback));
+        address[] memory targets = new address[](1);
+        targets[0] = address(collection);
+        uint256[] memory values = new uint256[](1);
+        bytes[] memory calls = new bytes[](1);
+        calls[0] = abi.encodeCall(collection.mint, (_publicAuth(), 2, address(0), "", _constraints()));
+        _prank(buyer);
+        ArchetypeBatchV100(BATCH).executeBatch(targets, values, calls);
+        assertEq(callback.count(), 2);
+        assertEq(callback.owners(1), buyer);
+        assertEq(callback.owners(2), buyer);
+        _prank(owner);
+        collection.setMintCallback(address(new MetadataRenderer()));
+        _prank(buyer);
+        vm.expectRevert();
+        collection.mint(_publicAuth(), 1, address(0), "", _constraints());
+        assertEq(collection.totalSupply(), 2);
+    }
+
+    function test_metadataRenderer_revealDisableAndBaseUri() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        MetadataRenderer renderer = new MetadataRenderer();
+        _setPublicInvite(collection, 0.1 ether, uint32(block.timestamp));
+        _mint(collection, buyer, _publicAuth(), 2, 0.2 ether);
+        assertEq(collection.tokenURI(1), string.concat(defaultConfig.baseUri, "1"));
+
+        _prank(owner);
+        vm.expectEmit(false, false, false, true, address(collection));
+        emit BatchMetadataUpdate(1, 2);
+        collection.setMetadataRenderer(address(renderer));
+        assertEq(collection.metadataRenderer(), address(renderer));
+        assertEq(collection.tokenURI(2), "hidden/2");
+        renderer.reveal();
+        vm.expectEmit(false, false, false, true, address(collection));
+        emit BatchMetadataUpdate(2, 2);
+        collection.refreshMetadata(2, 2);
+        assertEq(collection.tokenURI(2), "revealed/2");
+
+        vm.expectEmit(false, false, false, true, address(collection));
+        emit BatchMetadataUpdate(1, 2);
+        collection.setBaseURI("ipfs://new/");
+        assertEq(collection.tokenURI(2), "revealed/2");
+        vm.expectEmit(false, false, false, true, address(collection));
+        emit BatchMetadataUpdate(1, 2);
+        collection.setMetadataRenderer(address(0));
+        assertEq(collection.metadataRenderer(), address(0));
+        assertEq(collection.tokenURI(2), "ipfs://new/2");
+        collection.setBaseURI("");
+        assertEq(collection.tokenURI(1), "");
+        assertEq(collection.totalSupply(), 2);
+        assertEq(collection.ownerOf(2), buyer);
+    }
+
+    function test_metadataRenderer_failuresRemainVisibleAndExistenceWins() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        MetadataRenderer renderer = new MetadataRenderer();
+        _setPublicInvite(collection, 0.1 ether, uint32(block.timestamp));
+        _mintPublic(collection, buyer, address(0), 0.1 ether);
+        _prank(owner);
+        collection.setMetadataRenderer(address(renderer));
+        renderer.fail();
+        vm.expectRevert(MetadataRenderer.RenderingFailed.selector);
+        collection.tokenURI(1);
+        vm.expectRevert(IERC721AUpgradeable.URIQueryForNonexistentToken.selector);
+        collection.tokenURI(0);
+        vm.expectRevert(IERC721AUpgradeable.URIQueryForNonexistentToken.selector);
+        collection.tokenURI(2);
+
+        collection.setMetadataRenderer(address(new MalformedMetadataRenderer()));
+        vm.expectRevert();
+        collection.tokenURI(1);
+        collection.setMetadataRenderer(address(0));
+        assertEq(collection.tokenURI(1), string.concat(defaultConfig.baseUri, "1"));
+    }
+
+    function test_metadataRenderer_ownerAuthorityAndUriLock() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        MetadataRenderer renderer = new MetadataRenderer();
+        _setPublicInvite(collection, 0.1 ether, uint32(block.timestamp));
+        _mintPublic(collection, buyer, address(0), 0.1 ether);
+        _prank(other);
+        vm.expectRevert(NotOwner.selector);
+        collection.setMetadataRenderer(address(renderer));
+        vm.expectRevert(NotOwner.selector);
+        collection.refreshMetadata(1, 1);
+        _prank(owner);
+        vm.expectRevert(ArchetypeErc721a.InvalidMetadataRenderer.selector);
+        collection.setMetadataRenderer(other);
+        vm.expectRevert(ArchetypeErc721a.InvalidMetadataRenderer.selector);
+        collection.setMetadataRenderer(address(collection));
+        collection.setMetadataRenderer(address(renderer));
+        collection.transferOwnership(other);
+        vm.expectRevert(NotOwner.selector);
+        collection.refreshMetadata(1, 1);
+        vm.expectRevert(NotOwner.selector);
+        collection.setMetadataRenderer(address(0));
+        _prank(other);
+        collection.lockURI("forever");
+        vm.expectRevert(LockedForever.selector);
+        collection.setMetadataRenderer(address(0));
+        vm.expectRevert(LockedForever.selector);
+        collection.setMetadataRenderer(address(renderer));
+        vm.expectRevert(LockedForever.selector);
+        collection.setBaseURI("new/");
+        renderer.reveal();
+        vm.expectEmit(false, false, false, true, address(collection));
+        emit BatchMetadataUpdate(1, 1);
+        collection.refreshMetadata(1, 1);
+        assertEq(collection.tokenURI(1), "revealed/1");
+    }
+
+    function test_implementationFitsEip170RuntimeLimit() public view {
+        assertLe(address(archetypeImplementation).code.length, 24_576);
+    }
+
+    function test_metadataRefresh_extensionsCanAnnounceRevealAfterUriLock() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        MetadataRenderer renderer = new MetadataRenderer();
+        MintCallback callback = new MintCallback(collection);
+        _setPublicInvite(collection, 0, uint32(block.timestamp));
+        collection.setMetadataRenderer(address(renderer));
+        collection.setMintCallback(address(callback));
+        _mint(collection, buyer, _publicAuth(), 2, 0);
+        _prank(owner);
+        collection.lockURI("forever");
+        assertEq(collection.tokenURI(1), "hidden/1");
+
+        _prank(other);
+        vm.expectRevert(NotOwner.selector);
+        collection.refreshMetadata(1, 2);
+        vm.expectRevert(ArchetypeErc721a.InvalidMetadataRange.selector);
+        renderer.revealAndRefresh(collection, 1, 3);
+        assertFalse(renderer.revealed());
+        vm.expectEmit(false, false, false, true, address(collection));
+        emit BatchMetadataUpdate(1, 2);
+        renderer.revealAndRefresh(collection, 1, 2);
+        assertEq(collection.tokenURI(1), "revealed/1");
+        assertEq(collection.tokenURI(2), "revealed/2");
+        vm.expectEmit(false, false, false, true, address(collection));
+        emit BatchMetadataUpdate(2, 2);
+        callback.refreshMetadata(2, 2);
+        vm.expectRevert(ArchetypeErc721a.InvalidMetadataRange.selector);
+        callback.refreshMetadata(0, 2);
+    }
+
+    function test_metadataRefresh_replacedAndDisabledExtensionsLoseAccess() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        MetadataRenderer oldRenderer = new MetadataRenderer();
+        MintCallback oldCallback = new MintCallback(collection);
+        _setPublicInvite(collection, 0, uint32(block.timestamp));
+        collection.setMetadataRenderer(address(oldRenderer));
+        collection.setMintCallback(address(oldCallback));
+        _mint(collection, buyer, _publicAuth(), 1, 0);
+        MetadataRenderer renderer = new MetadataRenderer();
+        MintCallback callback = new MintCallback(collection);
+        _prank(owner);
+        collection.setMetadataRenderer(address(renderer));
+        collection.setMintCallback(address(callback));
+        vm.expectRevert(NotOwner.selector);
+        oldRenderer.revealAndRefresh(collection, 1, 1);
+        vm.expectRevert(NotOwner.selector);
+        oldCallback.refreshMetadata(1, 1);
+        vm.expectEmit(false, false, false, true, address(collection));
+        emit BatchMetadataUpdate(1, 1);
+        renderer.revealAndRefresh(collection, 1, 1);
+        vm.expectEmit(false, false, false, true, address(collection));
+        emit BatchMetadataUpdate(1, 1);
+        callback.refreshMetadata(1, 1);
+        collection.setMetadataRenderer(address(0));
+        collection.setMintCallback(address(0));
+        vm.expectRevert(NotOwner.selector);
+        renderer.revealAndRefresh(collection, 1, 1);
+        vm.expectRevert(NotOwner.selector);
+        callback.refreshMetadata(1, 1);
+        vm.expectEmit(false, false, false, true, address(collection));
+        emit BatchMetadataUpdate(1, 1);
+        collection.refreshMetadata(1, 1);
+    }
+
+    function test_metadataRefresh_emptyCollectionRangesAndInterfaces() public {
+        ArchetypeErc721a collection = _createCollection(owner);
+        MetadataRenderer renderer = new MetadataRenderer();
+        _prank(owner);
+        vm.recordLogs();
+        collection.setBaseURI("new/");
+        collection.setMetadataRenderer(address(renderer));
+        collection.setMetadataRenderer(address(0));
+        assertEq(vm.getRecordedLogs().length, 0);
+        vm.expectRevert(ArchetypeErc721a.InvalidMetadataRange.selector);
+        collection.refreshMetadata(1, 1);
+        _setPublicInvite(collection, 0.1 ether, uint32(block.timestamp));
+        _mint(collection, buyer, _publicAuth(), 2, 0.2 ether);
+        _prank(owner);
+        vm.expectRevert(ArchetypeErc721a.InvalidMetadataRange.selector);
+        collection.refreshMetadata(0, 1);
+        vm.expectRevert(ArchetypeErc721a.InvalidMetadataRange.selector);
+        collection.refreshMetadata(2, 1);
+        vm.expectRevert(ArchetypeErc721a.InvalidMetadataRange.selector);
+        collection.refreshMetadata(1, 3);
+        vm.expectRevert(ArchetypeErc721a.InvalidMetadataRange.selector);
+        collection.refreshMetadata(1, type(uint256).max);
+        vm.expectEmit(false, false, false, true, address(collection));
+        emit BatchMetadataUpdate(1, 2);
+        collection.refreshMetadata(1, 2);
+        assertTrue(collection.supportsInterface(0x49064906));
+        assertTrue(collection.supportsInterface(0x01ffc9a7));
+        assertTrue(collection.supportsInterface(0x80ac58cd));
+        assertTrue(collection.supportsInterface(0x5b5e139f));
+        assertTrue(collection.supportsInterface(0x2a55205a));
+        assertFalse(collection.supportsInterface(0xffffffff));
     }
 
     function test_lockURI_failsWhenCallerIsNotOwner() public {

@@ -14,6 +14,7 @@
 //                                                        "Y88P"  888
 
 pragma solidity ^0.8.20;
+import {IMintPricing} from "./IMintPricing.sol";
 
 import "../ArchetypePayouts.sol";
 import "../IArchetypeBatch.sol";
@@ -142,20 +143,45 @@ struct Erc721BatchMint {
 uint16 constant MAXBPS = 5000; // max fee or discount is 50%
 uint32 constant UINT32_MAX = 2 ** 32 - 1;
 
+struct MintPricing {
+    address calculator;
+    uint256 sold;
+}
+
 library ArchetypeLogicErc721a {
     using SafeERC20 for IERC20;
+
+    function setMintPricing(Invite storage invite, MintPricing storage pricing, bytes32 key, address calculator)
+        public
+    {
+        if (
+            calculator != address(0)
+                && (calculator == address(this) || calculator.code.length == 0 || !isPublicInvite(invite, key))
+        ) revert InvalidConfig();
+        pricing.calculator = calculator;
+    }
 
     event Invited(bytes32 indexed key, bytes32 indexed cid);
     event BurnInvited(bytes32 indexed key, bytes32 indexed cid);
     event Referral(address indexed affiliate, address token, uint128 wad, uint256 numMints, uint256 paymentValue);
 
     // calculate price based on affiliate usage and mint discounts
-    function computePrice(Invite storage invite, uint16 affiliateDiscount, uint256 numTokens, bool affiliateUsed)
-        public
-        view
-        returns (uint128)
-    {
-        uint256 cost = uint256(invite.price) * numTokens;
+    function computePrice(
+        Invite storage invite,
+        MintPricing storage pricing,
+        bytes32 key,
+        uint16 affiliateDiscount,
+        uint256 numTokens,
+        bool affiliateUsed
+    ) public view returns (uint128) {
+        uint256 cost;
+        if (pricing.calculator == address(0)) {
+            cost = uint256(invite.price) * numTokens;
+        } else {
+            if (!isPublicInvite(invite, key)) revert InvalidConfig();
+            cost = IMintPricing(pricing.calculator).getQuote(pricing.sold, numTokens);
+            if (cost > type(uint128).max) revert MintCostOverflow();
+        }
 
         if (affiliateUsed) {
             cost = cost - ((cost * affiliateDiscount) / 10000);
@@ -169,12 +195,13 @@ library ArchetypeLogicErc721a {
         Invite storage invite,
         Config storage config,
         PayoutConfig storage payoutConfig,
+        MintPricing storage pricing,
         bytes32 key,
         uint256 paidQuantity,
         bool affiliateUsed,
         uint256 nativeMinimumFee
     ) public view returns (MintPayment memory payment) {
-        payment.currencyCost = computePrice(invite, config.affiliateDiscount, paidQuantity, affiliateUsed);
+        payment.currencyCost = computePrice(invite, pricing, key, config.affiliateDiscount, paidQuantity, affiliateUsed);
 
         bool isPublic = isPublicInvite(invite, key);
         if (!isPublic) {

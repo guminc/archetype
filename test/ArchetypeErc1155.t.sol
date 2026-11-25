@@ -39,7 +39,7 @@ import {
 } from "../src/ERC1155/ArchetypeLogicErc1155.sol";
 import {FactoryErc1155, InsufficientDeployFee} from "../src/ERC1155/FactoryErc1155.sol";
 import {TestErc20} from "../src/TestErc20.sol";
-import {RoyaltyPolicyRegistry} from "../src/RoyaltyPolicyRegistry.sol";
+import {ScatterCollectionRegistry} from "../src/ScatterCollectionRegistry.sol";
 import {NoReturnErc20} from "./mocks/NoReturnErc20.sol";
 import {FeeOnTransferErc20} from "./mocks/FeeOnTransferErc20.sol";
 import {MintFeeRegistry} from "../src/MintFeeRegistry.sol";
@@ -64,7 +64,7 @@ contract ArchetypeErc1155Test is Test {
 
     ArchetypeErc1155 internal archetypeImplementation;
     FactoryErc1155 internal factory;
-    RoyaltyPolicyRegistry internal royaltyPolicyRegistry;
+    ScatterCollectionRegistry internal scatterCollectionRegistry;
     MintFeeRegistry internal mintFeeRegistry;
     AffiliateSignerRegistry internal affiliateSignerRegistry;
 
@@ -114,8 +114,8 @@ contract ArchetypeErc1155Test is Test {
         ArchetypePayouts payoutsImpl = new ArchetypePayouts();
         vm.etch(PAYOUTS, address(payoutsImpl).code);
 
-        royaltyPolicyRegistry = new RoyaltyPolicyRegistry(owner);
-        ArchetypeBatchV100 batchImpl = new ArchetypeBatchV100(address(this), royaltyPolicyRegistry);
+        scatterCollectionRegistry = new ScatterCollectionRegistry(owner);
+        ArchetypeBatchV100 batchImpl = new ArchetypeBatchV100(address(this), scatterCollectionRegistry);
         vm.etch(BATCH, address(batchImpl).code);
 
         mintFeeRegistry = new MintFeeRegistry(owner, other, 0, 1 ether, 0);
@@ -124,8 +124,8 @@ contract ArchetypeErc1155Test is Test {
             new ArchetypeErc1155(PLATFORM, PAYOUTS, BATCH, mintFeeRegistry, affiliateSignerRegistry);
 
         _prank(owner);
-        factory = new FactoryErc1155(address(archetypeImplementation), owner, royaltyPolicyRegistry);
-        royaltyPolicyRegistry.setApprovedFactory(address(factory), true);
+        factory = new FactoryErc1155(address(archetypeImplementation), owner, scatterCollectionRegistry);
+        scatterCollectionRegistry.setApprovedFactory(address(factory), true);
 
         _prank(other);
     }
@@ -170,7 +170,7 @@ contract ArchetypeErc1155Test is Test {
 
         assertEq(collection.symbol(), "POOKIE");
         assertEq(collection.owner(), owner);
-        assertTrue(royaltyPolicyRegistry.scatterCollections(address(collection)));
+        assertTrue(scatterCollectionRegistry.scatterCollections(address(collection)));
     }
 
     function test_createCollection_allowsTheSameSenderTwiceInOneBlock() public {

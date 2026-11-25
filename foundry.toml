@@ -6,7 +6,10 @@ optimizer = true
 optimizer_runs = 200
 via_ir = true
 evm_version = "cancun"
-fs_permissions = [{ access = "read", path = "./out" }]
+fs_permissions = [
+  { access = "read", path = "./out" },
+  { access = "read", path = "./test/fixtures" },
+]
 ignored_warnings_from = ["lib"]
 compilation_restrictions = [
   { paths = "lib/seaport/lib/seaport-core/**", version = "=0.8.24" },
@@ -17,6 +20,7 @@ compilation_restrictions = [
   { paths = "src/MintFeeRegistry.sol", version = "=0.8.36" },
   { paths = "src/ScatterAggregatorRouter.sol", version = "=0.8.36" },
   { paths = "src/ScatterBidRouter.sol", version = "=0.8.36" },
+  { paths = "src/ScatterExchange.sol", version = "=0.8.36" },
   { paths = "src/ScatterOfferer.sol", version = "=0.8.36" },
 ]
 

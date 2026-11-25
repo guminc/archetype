@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-// ScatterBidRouter v0.3.0
+// ScatterBidRouter v0.5.0
 pragma solidity ^0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -13,7 +13,9 @@ import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {SlotDerivation} from "@openzeppelin/contracts/utils/SlotDerivation.sol";
+import {TransientSlot} from "@openzeppelin/contracts/utils/TransientSlot.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import {SeaportInterface} from "seaport-types/src/interfaces/SeaportInterface.sol";
@@ -70,7 +72,7 @@ error SettlementNotAuthorized();
 contract ScatterBidRouter is
     Ownable2Step,
     Pausable,
-    ReentrancyGuard,
+    ReentrancyGuardTransient,
     ERC721Holder,
     ERC1155Holder,
     EIP712,
@@ -78,6 +80,8 @@ contract ScatterBidRouter is
     ZoneInterface
 {
     using SafeERC20 for IERC20;
+    using SlotDerivation for bytes32;
+    using TransientSlot for *;
 
     address public immutable SEAPORT =
         block.chainid == 4326 ? 0x00000000006687982678b03100B9bDC8be440814 : 0x0000000000000068F116a894984e2DB1123eB395;
@@ -92,7 +96,7 @@ contract ScatterBidRouter is
 
     address public immutable SCATTER_OFFERER;
     ScatterCollectionRegistry public immutable scatterCollectionRegistry;
-    address public activeRoutedFulfiller;
+    address public transient activeRoutedFulfiller;
 
     /// Server-held signer for affiliate fee authorizations. The owner may rotate it.
     address public feeAuthorizer;
@@ -130,11 +134,11 @@ contract ScatterBidRouter is
     }
 
     struct MatchedSource {
+        uint256 settlements;
         uint256 filledNumerator;
         uint256 filledDenominator;
         uint256 orderQuantity;
         uint256 quantity;
-        uint256 settlements;
     }
 
     struct MatchedCurrency {
@@ -142,11 +146,14 @@ contract ScatterBidRouter is
         uint256 proceeds;
     }
 
-    mapping(bytes32 => MatchedSettlement) private matchedSettlements;
-    mapping(bytes32 => MatchedSource) private matchedSources;
-    mapping(address => MatchedCurrency) private matchedCurrencies;
-    uint256 private matchedSettlementCount;
-    bool private matchedOrdersValidated;
+    /// `authorizeOrder` records matched settlements and `validateOrder` consumes them inside the
+    /// same Seaport call, so they live in transient storage. Each constant is the base slot of a
+    /// mapping from counterorder hash, source order hash, or currency to its record.
+    bytes32 private constant MATCHED_SETTLEMENTS_SLOT = keccak256("ScatterBidRouter.matchedSettlements");
+    bytes32 private constant MATCHED_SOURCES_SLOT = keccak256("ScatterBidRouter.matchedSources");
+    bytes32 private constant MATCHED_CURRENCIES_SLOT = keccak256("ScatterBidRouter.matchedCurrencies");
+    uint256 private transient matchedSettlementCount;
+    bool private transient matchedOrdersValidated;
 
     struct MinimumPayout {
         address currency;
@@ -239,7 +246,7 @@ contract ScatterBidRouter is
             revert InvalidSettlementOrder();
         }
         if (parameters.offer.length != 1 || parameters.consideration.length != 1) revert InvalidSettlementOrder();
-        if (matchedSettlements[parameters.orderHash].seller != address(0)) revert InvalidSettlementOrder();
+        if (_isMatchedSettlement(parameters.orderHash)) revert InvalidSettlementOrder();
         if (matchedSettlementCount == MAX_BATCH) revert BatchTooLarge();
 
         SpentItem calldata nft = parameters.offer[0];
@@ -255,16 +262,10 @@ contract ScatterBidRouter is
         uint256 orderQuantity = _validateMatchedProceeds(nft, payment, parameters.offerer, context);
         bytes32 sourceOrderHash = SeaportInterface(SEAPORT).getOrderHash(context.sourceOrder);
         _validateMatchedFeeAuthorization(parameters, sourceOrderHash, context);
-        Fees memory fees = _calculateBidFees(
-            payment.amount,
-            feeBps,
-            feeSplitBps,
-            context.affiliate,
-            scatterCollectionRegistry.rewardsRecipient(nft.token)
-        );
+        Fees memory fees = _calculateBidFees(payment.amount, feeBps, feeSplitBps, context.affiliate, nft.token);
         if (payment.amount - fees.totalAmount < context.minimumSellerPayout) revert InsufficientSellerPayout();
 
-        MatchedSource storage source = matchedSources[sourceOrderHash];
+        MatchedSource memory source = _loadMatchedSource(sourceOrderHash);
         if (source.settlements == 0) {
             for (uint256 i; i < parameters.orderHashes.length; ++i) {
                 if (parameters.orderHashes[i] == sourceOrderHash) revert InvalidSettlementOrder();
@@ -276,20 +277,25 @@ contract ScatterBidRouter is
         }
         source.quantity += nft.amount;
         ++source.settlements;
+        _storeMatchedSource(sourceOrderHash, source);
 
-        MatchedCurrency storage currency = matchedCurrencies[payment.token];
+        MatchedCurrency memory currency = _loadMatchedCurrency(payment.token);
         if (currency.proceeds == 0) currency.balanceBefore = IERC20(payment.token).balanceOf(address(this));
         currency.proceeds += payment.amount;
-        matchedSettlements[parameters.orderHash] = MatchedSettlement({
-            seller: parameters.offerer,
-            currency: payment.token,
-            collection: nft.token,
-            tokenId: nft.identifier,
-            quantity: nft.amount,
-            proceeds: payment.amount,
-            sourceOrderHash: sourceOrderHash,
-            fees: fees
-        });
+        _storeMatchedCurrency(payment.token, currency);
+        _storeMatchedSettlement(
+            parameters.orderHash,
+            MatchedSettlement({
+                seller: parameters.offerer,
+                currency: payment.token,
+                collection: nft.token,
+                tokenId: nft.identifier,
+                quantity: nft.amount,
+                proceeds: payment.amount,
+                sourceOrderHash: sourceOrderHash,
+                fees: fees
+            })
+        );
         ++matchedSettlementCount;
         return ZoneInterface.authorizeOrder.selector;
     }
@@ -302,19 +308,17 @@ contract ScatterBidRouter is
         returns (bytes4)
     {
         if (msg.sender != SEAPORT) revert OnlySeaport();
-        MatchedSettlement memory settlement = matchedSettlements[parameters.orderHash];
+        MatchedSettlement memory settlement = _loadMatchedSettlement(parameters.orderHash);
         if (settlement.seller == address(0)) revert SettlementNotAuthorized();
         if (!matchedOrdersValidated) {
             for (uint256 i; i < parameters.orderHashes.length; ++i) {
                 bytes32 orderHash = parameters.orderHashes[i];
-                if (matchedSettlements[orderHash].seller == address(0) && matchedSources[orderHash].settlements == 0) {
-                    revert InvalidSettlementOrder();
-                }
+                if (!_isMatchedSettlement(orderHash) && !_isMatchedSource(orderHash)) revert InvalidSettlementOrder();
             }
             matchedOrdersValidated = true;
         }
 
-        MatchedSource storage source = matchedSources[settlement.sourceOrderHash];
+        MatchedSource memory source = _loadMatchedSource(settlement.sourceOrderHash);
         (,, uint256 filled, uint256 size) = SeaportInterface(SEAPORT).getOrderStatus(settlement.sourceOrderHash);
         uint256 denominator = size * source.filledDenominator;
         if (denominator == 0) revert InvalidSettlementOrder();
@@ -324,13 +328,16 @@ contract ScatterBidRouter is
         }
 
         IERC20 token = IERC20(settlement.currency);
-        MatchedCurrency storage currency = matchedCurrencies[settlement.currency];
+        MatchedCurrency memory currency = _loadMatchedCurrency(settlement.currency);
         uint256 balanceBefore = token.balanceOf(address(this));
         if (balanceBefore < currency.balanceBefore + currency.proceeds) revert CurrencyBalanceInvariant();
         currency.proceeds -= settlement.proceeds;
-        if (currency.proceeds == 0) delete matchedCurrencies[settlement.currency];
-        if (--source.settlements == 0) delete matchedSources[settlement.sourceOrderHash];
-        delete matchedSettlements[parameters.orderHash];
+        if (currency.proceeds == 0) delete currency;
+        _storeMatchedCurrency(settlement.currency, currency);
+        if (--source.settlements == 0) delete source;
+        _storeMatchedSource(settlement.sourceOrderHash, source);
+        MatchedSettlement memory settled;
+        _storeMatchedSettlement(parameters.orderHash, settled);
         if (--matchedSettlementCount == 0) matchedOrdersValidated = false;
 
         uint256 sellerPayout = settlement.proceeds - settlement.fees.totalAmount;
@@ -362,6 +369,78 @@ contract ScatterBidRouter is
 
     function supportsInterface(bytes4 interfaceId) public view override(ERC1155Holder, ZoneInterface) returns (bool) {
         return interfaceId == type(ZoneInterface).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    function _isMatchedSettlement(bytes32 orderHash) internal view returns (bool) {
+        return MATCHED_SETTLEMENTS_SLOT.deriveMapping(orderHash).asAddress().tload() != address(0);
+    }
+
+    function _loadMatchedSettlement(bytes32 orderHash) internal view returns (MatchedSettlement memory settlement) {
+        bytes32 slot = MATCHED_SETTLEMENTS_SLOT.deriveMapping(orderHash);
+        settlement.seller = slot.asAddress().tload();
+        settlement.currency = slot.offset(1).asAddress().tload();
+        settlement.collection = slot.offset(2).asAddress().tload();
+        settlement.tokenId = slot.offset(3).asUint256().tload();
+        settlement.quantity = slot.offset(4).asUint256().tload();
+        settlement.proceeds = slot.offset(5).asUint256().tload();
+        settlement.sourceOrderHash = slot.offset(6).asBytes32().tload();
+        settlement.fees.totalAmount = slot.offset(7).asUint256().tload();
+        settlement.fees.platformAmount = slot.offset(8).asUint256().tload();
+        settlement.fees.rewardsAmount = slot.offset(9).asUint256().tload();
+        settlement.fees.affiliateAmount = slot.offset(10).asUint256().tload();
+        settlement.fees.rewardsRecipient = slot.offset(11).asAddress().tload();
+        settlement.fees.affiliate = slot.offset(12).asAddress().tload();
+    }
+
+    function _storeMatchedSettlement(bytes32 orderHash, MatchedSettlement memory settlement) internal {
+        bytes32 slot = MATCHED_SETTLEMENTS_SLOT.deriveMapping(orderHash);
+        slot.asAddress().tstore(settlement.seller);
+        slot.offset(1).asAddress().tstore(settlement.currency);
+        slot.offset(2).asAddress().tstore(settlement.collection);
+        slot.offset(3).asUint256().tstore(settlement.tokenId);
+        slot.offset(4).asUint256().tstore(settlement.quantity);
+        slot.offset(5).asUint256().tstore(settlement.proceeds);
+        slot.offset(6).asBytes32().tstore(settlement.sourceOrderHash);
+        slot.offset(7).asUint256().tstore(settlement.fees.totalAmount);
+        slot.offset(8).asUint256().tstore(settlement.fees.platformAmount);
+        slot.offset(9).asUint256().tstore(settlement.fees.rewardsAmount);
+        slot.offset(10).asUint256().tstore(settlement.fees.affiliateAmount);
+        slot.offset(11).asAddress().tstore(settlement.fees.rewardsRecipient);
+        slot.offset(12).asAddress().tstore(settlement.fees.affiliate);
+    }
+
+    function _isMatchedSource(bytes32 sourceOrderHash) internal view returns (bool) {
+        return MATCHED_SOURCES_SLOT.deriveMapping(sourceOrderHash).asUint256().tload() != 0;
+    }
+
+    function _loadMatchedSource(bytes32 sourceOrderHash) internal view returns (MatchedSource memory source) {
+        bytes32 slot = MATCHED_SOURCES_SLOT.deriveMapping(sourceOrderHash);
+        source.settlements = slot.asUint256().tload();
+        source.filledNumerator = slot.offset(1).asUint256().tload();
+        source.filledDenominator = slot.offset(2).asUint256().tload();
+        source.orderQuantity = slot.offset(3).asUint256().tload();
+        source.quantity = slot.offset(4).asUint256().tload();
+    }
+
+    function _storeMatchedSource(bytes32 sourceOrderHash, MatchedSource memory source) internal {
+        bytes32 slot = MATCHED_SOURCES_SLOT.deriveMapping(sourceOrderHash);
+        slot.asUint256().tstore(source.settlements);
+        slot.offset(1).asUint256().tstore(source.filledNumerator);
+        slot.offset(2).asUint256().tstore(source.filledDenominator);
+        slot.offset(3).asUint256().tstore(source.orderQuantity);
+        slot.offset(4).asUint256().tstore(source.quantity);
+    }
+
+    function _loadMatchedCurrency(address token) internal view returns (MatchedCurrency memory currency) {
+        bytes32 slot = MATCHED_CURRENCIES_SLOT.deriveMapping(token);
+        currency.balanceBefore = slot.asUint256().tload();
+        currency.proceeds = slot.offset(1).asUint256().tload();
+    }
+
+    function _storeMatchedCurrency(address token, MatchedCurrency memory currency) internal {
+        bytes32 slot = MATCHED_CURRENCIES_SLOT.deriveMapping(token);
+        slot.asUint256().tstore(currency.balanceBefore);
+        slot.offset(1).asUint256().tstore(currency.proceeds);
     }
 
     function _validateMatchedProceeds(
@@ -454,8 +533,8 @@ contract ScatterBidRouter is
                 )
             )
         );
-        (address signer, ECDSA.RecoverError error,) = ECDSA.tryRecover(digest, context.feeAuthorizationSignature);
-        if (error != ECDSA.RecoverError.NoError || signer != feeAuthorizer) {
+        (address signer, ECDSA.RecoverError recoverError,) = ECDSA.tryRecover(digest, context.feeAuthorizationSignature);
+        if (recoverError != ECDSA.RecoverError.NoError || signer != feeAuthorizer) {
             revert InvalidFeeAuthorization();
         }
     }
@@ -554,6 +633,12 @@ contract ScatterBidRouter is
         _unpause();
     }
 
+    /// @dev Seaport pays any native balance it holds to its caller when a fulfillment completes, so a sale
+    /// through `sellIntoBids` must be able to receive it. The router keeps what arrives.
+    receive() external payable {
+        if (msg.sender != SEAPORT) revert OnlySeaport();
+    }
+
     function _sellIntoBid(
         AdvancedOrder calldata order,
         CriteriaResolver[] calldata resolvers,
@@ -588,8 +673,7 @@ contract ScatterBidRouter is
             return proceeds;
         }
 
-        address rewardsRecipient = scatterCollectionRegistry.rewardsRecipient(bid.collection);
-        Fees memory fees = _calculateBidFees(proceeds, appliedFeeBps, appliedFeeSplitBps, affiliate, rewardsRecipient);
+        Fees memory fees = _calculateBidFees(proceeds, appliedFeeBps, appliedFeeSplitBps, affiliate, bid.collection);
         sellerPayout = proceeds - fees.totalAmount;
 
         _distributeFeesErc20(token, fees);
@@ -795,8 +879,8 @@ contract ScatterBidRouter is
         uint256 appliedFeeBps,
         uint256 appliedFeeSplitBps,
         address affiliate,
-        address rewardsRecipient
-    ) internal pure returns (Fees memory fees) {
+        address collection
+    ) internal view returns (Fees memory fees) {
         fees.totalAmount = Math.mulDiv(proceeds, appliedFeeBps, BPS_DENOMINATOR);
         if (affiliate != address(0)) {
             fees.platformAmount = Math.mulDiv(fees.totalAmount, appliedFeeSplitBps, BPS_DENOMINATOR);
@@ -804,6 +888,7 @@ contract ScatterBidRouter is
             fees.affiliate = fees.affiliateAmount > 0 ? affiliate : address(0);
             return fees;
         }
+        address rewardsRecipient = scatterCollectionRegistry.rewardsRecipient(collection);
         if (rewardsRecipient != address(0)) {
             fees.platformAmount = Math.mulDiv(fees.totalAmount, appliedFeeSplitBps, BPS_DENOMINATOR);
             fees.rewardsAmount = fees.totalAmount - fees.platformAmount;

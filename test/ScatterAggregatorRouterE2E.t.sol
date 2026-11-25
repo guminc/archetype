@@ -13,6 +13,7 @@ import {
     OrderHashMismatch
 } from "../src/ScatterAggregatorRouter.sol";
 import {ScatterOfferer} from "../src/ScatterOfferer.sol";
+import {ScatterExchange} from "../src/ScatterExchange.sol";
 import {
     AdvancedOrder,
     CriteriaResolver,
@@ -54,6 +55,7 @@ contract ScatterAggregatorRouterE2ETest is ConduitTest {
 
     ScatterAggregatorRouter internal subject;
     ScatterOfferer internal scatterOfferer;
+    ScatterExchange internal scatterExchange;
     address internal feeAuthorizer = vm.addr(FEE_AUTHORIZER_PK);
     ScatterCollectionRegistry internal scatterCollectionRegistry;
     MockERC721E2E internal nft721;
@@ -81,14 +83,21 @@ contract ScatterAggregatorRouterE2ETest is ConduitTest {
 
         scatterCollectionRegistry = new ScatterCollectionRegistry(address(this));
         scatterOfferer = new ScatterOfferer(owner, scatterCollectionRegistry, feeAuthorizer, conduitKey);
+        scatterExchange = new ScatterExchange(owner, scatterCollectionRegistry, feeAuthorizer);
         subject = new ScatterAggregatorRouter(
-            owner, scatterCollectionRegistry, feeAuthorizer, address(scatterOfferer), conduitKey
+            owner,
+            scatterCollectionRegistry,
+            feeAuthorizer,
+            address(scatterOfferer),
+            address(scatterExchange),
+            conduitKey
         );
         _openConduitChannel(address(scatterOfferer));
         _openConduitChannel(address(subject));
         _openConduitChannel(subject.SEAPORT());
         _prank(owner);
         scatterOfferer.setTrustedRouter(address(subject), true);
+        scatterExchange.setTrustedRouter(address(subject), true);
         nft721 = new MockERC721E2E();
         nft1155 = new MockERC1155E2E();
         erc20 = new MockERC20E2E();

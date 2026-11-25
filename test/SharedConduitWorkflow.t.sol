@@ -25,6 +25,7 @@ import {ScatterCollectionRegistry} from "../src/ScatterCollectionRegistry.sol";
 import {ScatterOfferer} from "../src/ScatterOfferer.sol";
 import {ScatterBidRouter} from "../src/ScatterBidRouter.sol";
 import {ScatterAggregatorRouter} from "../src/ScatterAggregatorRouter.sol";
+import {ScatterExchange} from "../src/ScatterExchange.sol";
 import {ConduitConsumer, InvalidConduit} from "../src/ConduitConsumer.sol";
 import {ConduitTest} from "./helpers/ConduitTest.sol";
 
@@ -54,8 +55,12 @@ contract SharedConduitWorkflowTest is ConduitTest {
         offerer = new ScatterOfferer(address(this), registry, address(this), conduitKey);
         bidRouter = new ScatterBidRouter(address(this), address(this), registry, address(offerer), conduitKey);
         bidRouter.setAllowedCurrency(address(currency), true);
-        aggregator = new ScatterAggregatorRouter(address(this), registry, address(this), address(offerer), conduitKey);
+        ScatterExchange exchange = new ScatterExchange(address(this), registry, address(this));
+        aggregator = new ScatterAggregatorRouter(
+            address(this), registry, address(this), address(offerer), address(exchange), conduitKey
+        );
         offerer.setTrustedRouter(address(aggregator), true);
+        exchange.setTrustedRouter(address(aggregator), true);
         deployCodeTo("Seaport.sol:Seaport", abi.encode(address(conduitController)), offerer.SEAPORT());
         seaport = SeaportInterface(offerer.SEAPORT());
         helper = new TransferHelper(address(conduitController));

@@ -460,6 +460,18 @@ contract ScatterBidRouterMatchedTest is ScatterBidRouterE2ETest {
         assertEq(currency.balanceOf(address(router)), 13 ether);
     }
 
+    function test_matchedSaleGasStaysWithinSellerBudget() public {
+        registry.setRewardsOverride(address(nft721), rewards);
+        AdvancedOrder[] memory orders = _pair(false, 1, 1, address(currency), 2 ether, 1, 1);
+        _match(orders);
+
+        // A seller's wallet must cover the gas of the whole call before refunds. Settlement
+        // records written to persistent storage would add about 400,000 gas to this sale.
+        assertLt(vm.lastCallGas().gasTotalUsed, 500_000);
+        assertEq(nft721.ownerOf(1), bidder);
+        assertEq(currency.balanceOf(seller), 1.8525 ether);
+    }
+
     function _pair(
         bool erc1155,
         uint256 tokenId,

@@ -29,6 +29,8 @@ import {
     InvalidScatterCollectionRegistry,
     InvalidListingCollection,
     InvalidScatterOfferer,
+    InvalidScatterExchange,
+    EmptyExchangeSweep,
     InvalidFeeAuthorization,
     FeeAuthorizationExpired,
     InvalidFeeBps,
@@ -57,6 +59,7 @@ contract ScatterAggregatorRouterTest is ConduitTest {
     address internal constant SEAPORT = 0x0000000000000068F116a894984e2DB1123eB395;
     address internal constant PLATFORM = 0x8952caF7E5bf1fe63ebe94148ca802F3eF127C98;
     address internal constant SCATTER_OFFERER = address(0x1001);
+    address internal constant SCATTER_EXCHANGE = address(0x1002);
     address internal constant COLLECTION_ONE = address(0x1003);
     address internal constant COLLECTION_TWO = address(0x1004);
 
@@ -87,13 +90,15 @@ contract ScatterAggregatorRouterTest is ConduitTest {
         vm.etch(COLLECTION_ONE, hex"00");
         vm.etch(COLLECTION_TWO, hex"00");
         vm.etch(SCATTER_OFFERER, hex"00");
+        vm.etch(SCATTER_EXCHANGE, hex"00");
         seaportFulfillCalldata = _seaportFulfillAdvancedCalldata(_sweepOrders()[0]);
         seaportSweepCalldata = _sweepCalldata(_sweepOrders());
         externalOrderHash = _orderHashes(_singleOrder(_sweepOrders()[0]))[0];
 
         scatterCollectionRegistry = new ScatterCollectionRegistry(address(this));
-        subject =
-            new ScatterAggregatorRouter(owner, scatterCollectionRegistry, feeAuthorizer, SCATTER_OFFERER, conduitKey);
+        subject = new ScatterAggregatorRouter(
+            owner, scatterCollectionRegistry, feeAuthorizer, SCATTER_OFFERER, SCATTER_EXCHANGE, conduitKey
+        );
         _openConduitChannel(address(subject));
         _openConduitChannel(SEAPORT);
         token = new ERC20Mock();
@@ -143,14 +148,23 @@ contract ScatterAggregatorRouterTest is ConduitTest {
     function test_constructor_rejectsInvalidDependencies() public {
         vm.expectRevert(InvalidScatterCollectionRegistry.selector);
         new ScatterAggregatorRouter(
-            owner, ScatterCollectionRegistry(address(0)), feeAuthorizer, SCATTER_OFFERER, conduitKey
+            owner, ScatterCollectionRegistry(address(0)), feeAuthorizer, SCATTER_OFFERER, SCATTER_EXCHANGE, conduitKey
         );
 
         vm.expectRevert(InvalidFeeAuthorizer.selector);
-        new ScatterAggregatorRouter(owner, scatterCollectionRegistry, address(0), SCATTER_OFFERER, conduitKey);
+        new ScatterAggregatorRouter(
+            owner, scatterCollectionRegistry, address(0), SCATTER_OFFERER, SCATTER_EXCHANGE, conduitKey
+        );
 
         vm.expectRevert(InvalidScatterOfferer.selector);
-        new ScatterAggregatorRouter(owner, scatterCollectionRegistry, feeAuthorizer, address(0x9999), conduitKey);
+        new ScatterAggregatorRouter(
+            owner, scatterCollectionRegistry, feeAuthorizer, address(0x9999), SCATTER_EXCHANGE, conduitKey
+        );
+
+        vm.expectRevert(InvalidScatterExchange.selector);
+        new ScatterAggregatorRouter(
+            owner, scatterCollectionRegistry, feeAuthorizer, SCATTER_OFFERER, address(0x9999), conduitKey
+        );
     }
 
     function test_pause_pausesContract() public {
@@ -3241,6 +3255,87 @@ contract ScatterAggregatorRouterTest is ConduitTest {
         assertEq(paymentToken.balanceOf(subject.SEAPORT()), 1 ether);
         assertEq(paymentToken.balanceOf(subject.PLATFORM()), 0.05 ether);
         assertEq(paymentToken.allowance(address(subject), subject.SEAPORT()), 0);
+    }
+
+    function test_affiliatePaths_skipRewardsRecipientLookup() public {
+        vm.expectCall(
+            address(scatterCollectionRegistry),
+            abi.encodeWithSelector(ScatterCollectionRegistry.rewardsRecipient.selector),
+            0
+        );
+
+        bytes memory sigNative = _feeAuthSig(buyer, affiliate, keccak256(abi.encode(externalOrderHash)));
+        _prank(buyer);
+        subject.buyExternalListing{value: 1.05 ether}(
+            seaportFulfillCalldata, 1 ether, affiliate, externalOrderHash, _feeAuthDeadline(), sigNative, 500
+        );
+
+        (bytes memory erc20Calldata, bytes32 erc20Hash) = _prepareErc20Listing(address(token), 1 ether);
+        mockSeaport.setConsumeToken(address(token), 1 ether);
+        bytes memory sigErc20 = _feeAuthSig(buyer, affiliate, keccak256(abi.encode(erc20Hash)));
+        _prank(buyer);
+        subject.buyExternalListingERC20(
+            erc20Calldata, address(token), 1 ether, affiliate, erc20Hash, _feeAuthDeadline(), sigErc20, 500
+        );
+
+        mockSeaport.setOrderStatus(externalOrderHash, 0, 0);
+        mockSeaport.setAvailableFulfillmentReturn(_fillsCompleted(true, true));
+        mockSeaport.setConsumeToken(address(0), 0);
+        _prank(buyer);
+        subject.sweepMixed{value: 2.08 ether}(
+            seaportSweepCalldata,
+            2 ether,
+            _externalSweepFills(),
+            _emptyAddresses(),
+            _emptyUints(),
+            affiliate,
+            _feeAuthDeadline(),
+            _feeAuthSig(buyer, affiliate, _sweepOrdersHash()),
+            500
+        );
+
+        mockSeaport.setOrderStatus(erc20Hash, 0, 0);
+        AdvancedOrder[] memory erc20Orders = _erc20SweepOrders(address(token));
+        bytes32[] memory erc20Hashes = _orderHashes(erc20Orders);
+        mockSeaport.setAvailableOrderHashes(erc20Hashes);
+        mockSeaport.setAvailableFulfillmentReturn(_fillsCompleted(true, true));
+        mockSeaport.setConsumeToken(address(token), 1.6 ether);
+        _prank(buyer);
+        subject.sweepERC20(
+            _sweepCalldata(erc20Orders),
+            address(token),
+            1.6 ether,
+            _externalSweepFills(),
+            affiliate,
+            _feeAuthDeadline(),
+            _feeAuthSig(buyer, affiliate, keccak256(abi.encode(erc20Hashes))),
+            500
+        );
+    }
+
+    function test_sweepERC20_aggregatesPlatformAndAffiliateTransfers() public {
+        AdvancedOrder[] memory orders = _erc20SweepOrders(address(token));
+        bytes32[] memory orderHashes = _orderHashes(orders);
+        mockSeaport.setAvailableOrderHashes(orderHashes);
+        mockSeaport.setAvailableFulfillmentReturn(_fillsCompleted(true, true));
+        mockSeaport.setConsumeToken(address(token), 1.6 ether);
+
+        vm.expectCall(address(token), abi.encodeCall(IERC20.transfer, (subject.PLATFORM(), 0.04 ether)), 1);
+        vm.expectCall(address(token), abi.encodeCall(IERC20.transfer, (affiliate, 0.04 ether)), 1);
+        _prank(buyer);
+        subject.sweepERC20(
+            _sweepCalldata(orders),
+            address(token),
+            1.6 ether,
+            _externalSweepFills(),
+            affiliate,
+            _feeAuthDeadline(),
+            _feeAuthSig(buyer, affiliate, keccak256(abi.encode(orderHashes))),
+            500
+        );
+
+        assertEq(token.balanceOf(subject.PLATFORM()), 0.04 ether);
+        assertEq(token.balanceOf(affiliate), 0.04 ether);
     }
 
     function _externalSweepFills() internal pure returns (uint256[] memory orderIndexes) {

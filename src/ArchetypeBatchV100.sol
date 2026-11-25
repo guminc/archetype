@@ -7,7 +7,7 @@ import {IERC721} from "openzeppelin-v4/token/ERC721/IERC721.sol";
 import {IERC1155} from "openzeppelin-v4/token/ERC1155/IERC1155.sol";
 import {Ownable} from "openzeppelin-v4/access/Ownable.sol";
 import {SafeERC20} from "openzeppelin-v4/token/ERC20/utils/SafeERC20.sol";
-import {RoyaltyPolicyRegistry} from "./RoyaltyPolicyRegistry.sol";
+import {ScatterCollectionRegistry} from "./ScatterCollectionRegistry.sol";
 import {MintConstraints} from "./MintConstraints.sol";
 
 interface IArchetypeV100Collection {
@@ -49,7 +49,7 @@ contract ArchetypeBatchV100 is Ownable {
 
     uint256 private constant _CURRENT_CALLER_SLOT = 0xa635c9f4c283427ea6864a49a31b6433e5a3c534efd58c9e71bb8c7d5e50ec76;
 
-    RoyaltyPolicyRegistry public immutable royaltyPolicyRegistry;
+    ScatterCollectionRegistry public immutable royaltyPolicyRegistry;
 
     error InvalidOwner();
     error InvalidRoyaltyPolicyRegistry();
@@ -60,13 +60,13 @@ contract ArchetypeBatchV100 is Ownable {
     error BatchBalanceDecreased();
     error NativeTransferFailed();
 
-    constructor(address owner_, RoyaltyPolicyRegistry royaltyPolicyRegistry_) {
+    constructor(address owner_, ScatterCollectionRegistry scatterCollectionRegistry_) {
         if (owner_ == address(0)) revert InvalidOwner();
-        if (address(royaltyPolicyRegistry_) == address(0) || address(royaltyPolicyRegistry_).code.length == 0) {
+        if (address(scatterCollectionRegistry_) == address(0) || address(scatterCollectionRegistry_).code.length == 0) {
             revert InvalidRoyaltyPolicyRegistry();
         }
 
-        royaltyPolicyRegistry = royaltyPolicyRegistry_;
+        royaltyPolicyRegistry = scatterCollectionRegistry_;
         _transferOwnership(owner_);
     }
 
